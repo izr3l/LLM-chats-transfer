@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Chat Transfer logo">
+  <rect x="2" y="2" width="124" height="124" rx="28" fill="#161b22" stroke="#30363d" stroke-width="4"/>
+  <path d="M28 44 h40 c8.8 0 16 7.2 16 16 v24 c0 8.8 -7.2 16 -16 16 h-8 l-16 16 v-16 h-16 c-8.8 0 -16 -7.2 -16 -16 v-24 c0 -8.8 7.2 -16 16 -16 z" fill="#21262d" stroke="#8b949e" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M48 24 h48 c8.8 0 16 7.2 16 16 v24 c0 8.8 -7.2 16 -16 16 h-16 v16 l-16 -16 h-16 c-8.8 0 -16 -7.2 -16 -16 v-24 c0 -8.8 7.2 -16 16 -16 z" fill="#0d1117" stroke="#58a6ff" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M52 56 h20 m-6 -6 l10 6 -10 6" fill="none" stroke="#58a6ff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
