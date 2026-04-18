@@ -202,39 +202,48 @@ if (!window.__chatTransferTargetRegistered) {
         try {
           const adapter = getAdapter();
           chrome.runtime.sendMessage({ type: 'FETCH_TRANSCRIPT' }, async (response) => {
-            const transcript = response?.payload as CanonicalConversation | null;
-            if (!transcript) {
-              sendResponse({ status: 'error', error: 'No pending transcript found.' });
-              return;
-            }
-            const { source, title, createdAt } = transcript.metadata;
-            const count = transcript.integrity?.messageCount ?? transcript.messages.length;
-
-            let raw = `Chat Transcript — ${title ?? 'Untitled'}\n`;
-            raw += `Source: ${source}  |  Messages: ${count}  |  Captured: ${new Date(createdAt).toLocaleString()}\n\n`;
-            raw += `--- TRANSCRIPT START ---\n\n`;
-
-            transcript.messages.forEach((m) => {
-              const role = m.role === 'user' ? 'User' : 'Assistant';
-              const text = m.content.map((c: { text?: string }) => c.text ?? '').join('\n').trim();
-              raw += `${role}:\n${text}\n`;
-              if (m.attachments && m.attachments.length > 0) {
-                raw += `Attachments (not auto-uploaded — user must re-upload manually):\n`;
-                m.attachments.forEach((att) => {
-                  raw += `  - [${att.kind}] ${att.name || 'unnamed file'}\n`;
-                });
+            try {
+              if (chrome.runtime.lastError) {
+                sendResponse({ status: 'error', error: chrome.runtime.lastError.message });
+                return;
               }
-              raw += '\n';
-            });
 
-            raw += `--- TRANSCRIPT END ---\n`;
-            raw = stripAttachmentPlaceholders(raw);
+              const transcript = response?.payload as CanonicalConversation | null;
+              if (!transcript) {
+                sendResponse({ status: 'error', error: 'No pending transcript found.' });
+                return;
+              }
+              const { source, title, createdAt } = transcript.metadata;
+              const count = transcript.integrity?.messageCount ?? transcript.messages.length;
 
-            const success = adapter.injectPrompt(raw);
-            if (success) {
-              sendResponse({ status: 'success' });
-            } else {
-              sendResponse({ status: 'error', error: 'Could not find a text input on this page.' });
+              let raw = `Chat Transcript — ${title ?? 'Untitled'}\n`;
+              raw += `Source: ${source}  |  Messages: ${count}  |  Captured: ${new Date(createdAt).toLocaleString()}\n\n`;
+              raw += `--- TRANSCRIPT START ---\n\n`;
+
+              transcript.messages.forEach((m) => {
+                const role = m.role === 'user' ? 'User' : 'Assistant';
+                const text = m.content.map((c: { text?: string }) => c.text ?? '').join('\n').trim();
+                raw += `${role}:\n${text}\n`;
+                if (m.attachments && m.attachments.length > 0) {
+                  raw += `Attachments (not auto-uploaded — user must re-upload manually):\n`;
+                  m.attachments.forEach((att) => {
+                    raw += `  - [${att.kind}] ${att.name || 'unnamed file'}\n`;
+                  });
+                }
+                raw += '\n';
+              });
+
+              raw += `--- TRANSCRIPT END ---\n`;
+              raw = stripAttachmentPlaceholders(raw);
+
+              const success = adapter.injectPrompt(raw);
+              if (success) {
+                sendResponse({ status: 'success' });
+              } else {
+                sendResponse({ status: 'error', error: 'Could not find a text input on this page.' });
+              }
+            } catch (e: unknown) {
+              sendResponse({ status: 'error', error: e instanceof Error ? e.message : String(e) });
             }
           });
         } catch (e: unknown) {

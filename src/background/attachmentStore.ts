@@ -57,15 +57,17 @@ export async function putBlobs(blobs: AttachmentBlob[]): Promise<void> {
   if (totalSize > MAX_TRANSFER_TOTAL) {
     throw new Error(`Total attachment size ${(totalSize / 1024 / 1024).toFixed(1)} MB exceeds 200 MB limit.`);
   }
+  // Validate individual sizes before opening the transaction to avoid leaving
+  // an open/aborted transaction on failure.
+  const oversizedBlob = blobs.find((blob) => blob.size > MAX_BLOB_SIZE);
+  if (oversizedBlob) {
+    throw new Error(`Attachment "${oversizedBlob.name}" exceeds 25 MB limit.`);
+  }
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
     for (const blob of blobs) {
-      if (blob.size > MAX_BLOB_SIZE) {
-        reject(new Error(`Attachment "${blob.name}" exceeds 25 MB limit.`));
-        return;
-      }
       store.put(blob);
     }
     tx.oncomplete = () => { db.close(); resolve(); };

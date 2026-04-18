@@ -72,22 +72,21 @@ To build and run this extension locally you need:
 
 1. **Capture Chat**: Open an interface containing your LLM chat (e.g., Claude), open the extension using the popup or the in-page floating toolbar, and click **Capture**. The extension extracts messages, detects file attachments, downloads them, and stores everything locally.
 2. **Review/Summarize**: A summary automatically runs in the background after capture. Click the summarize icon (✨) to view it, or use Re-summarize to force a fresh summary.
-3. **Download**: Click the download button to export the captured chat as TXT, Markdown, Word, or PDF.
+3. **Download**: Click the download button to export the captured chat as TXT, Markdown, Word (.doc), or PDF.
 4. **Paste to Target**: Open your target AI conversation (e.g., ChatGPT), click **Paste**, and choose a mode:
    - **Paste Inline** — Injects the full conversation with system framing
    - **Paste Raw** — Injects plain message text without framing
    - **Attach as PDF / TXT / DOC** — Generates a file and attaches it to the chat input
-5. **Automatic File Reattachment**: When pasting inline, any captured file attachments are automatically reattached to the target chat via file input or drag-drop.
+5. **File Attachments**: Captured file attachments are listed by name in the pasted transcript. You must re-upload them manually to the target chat — automatic reattachment is not supported.
 6. **Manage History**: Review old captured conversations in the history drawer. Load, download, or delete previous captures.
 
 ### How Attachment Capture Works
 
 When you capture a chat, the extension:
 1. Extracts attachment references from the DOM (images, file chips, download links)
-2. Downloads each file via the background service worker (cross-origin fetch with a host allowlist)
+2. Downloads each file via the page context (with session cookies) or falls back to background fetch
 3. Stores binary data as base64 in IndexedDB, linked to the transfer by numeric aliases
-4. Injects `[attachment:N "filename"]` placeholders into the transcript text
-5. On paste, resolves aliases back to real `File` objects and attaches them to the target chat
+4. Lists attachment names in the transcript so you can identify which files to re-upload manually
 
 ## 🛡️ Security Notes
 

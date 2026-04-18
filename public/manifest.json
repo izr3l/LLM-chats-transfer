@@ -24,8 +24,6 @@
     "https://api.groq.com/*",
     "https://api.openai.com/*",
     "https://*.oaiusercontent.com/*",
-    "https://*.openai.com/*",
-    "https://*.anthropic.com/*",
     "https://*.googleapis.com/*",
     "https://*.googleusercontent.com/*"
   ],
@@ -47,7 +45,7 @@
         "https://qwen.ai/*",
         "https://qwenlm.ai/*",
         "https://www.perplexity.ai/*",
-        "https://x.com/*"
+        "https://x.com/i/grok*"
       ],
       "js": ["content-toolbar.js"],
       "run_at": "document_idle"

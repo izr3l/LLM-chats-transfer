@@ -10,7 +10,7 @@ export interface AttachmentRef {
   url?: string;
   mimeType?: string;
   sourceHint?: string;
-  /** Numeric alias used as a placeholder in transcript text; replaced with actual blob on paste. */
+  /** Numeric alias used as a placeholder in transcript text; stripped on paste (user must re-upload files manually). */
   blobAlias?: number;
   /** Size in bytes of the captured blob (for display purposes). */
   blobSize?: number;

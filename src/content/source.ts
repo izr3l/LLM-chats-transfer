@@ -192,21 +192,31 @@ async function captureAttachmentBlobs(
     const lastMsg = conversation.messages[conversation.messages.length - 1];
     if (!lastMsg.attachments) lastMsg.attachments = [];
 
+    const requestAttachmentDownload = (
+      type: 'DOWNLOAD_IN_PAGE' | 'DOWNLOAD_ATTACHMENT_URL',
+      url: string
+    ) =>
+      new Promise<{
+        status: string;
+        dataBase64?: string;
+        mimeType?: string;
+        filename?: string;
+        size?: number;
+        error?: string;
+      }>((resolve) => {
+        chrome.runtime.sendMessage(
+          { type, url },
+          (resp) => resolve(resp ?? { status: 'error', error: 'No response' })
+        );
+      });
+
     for (const harvested of harvestedUrls) {
       try {
-        const response = await new Promise<{
-          status: string;
-          dataBase64?: string;
-          mimeType?: string;
-          filename?: string;
-          size?: number;
-          error?: string;
-        }>((resolve) => {
-          chrome.runtime.sendMessage(
-            { type: 'DOWNLOAD_ATTACHMENT_URL', url: harvested.url },
-            (resp) => resolve(resp ?? { status: 'error', error: 'No response' })
-          );
-        });
+        let response = await requestAttachmentDownload('DOWNLOAD_IN_PAGE', harvested.url);
+        if (response.status !== 'success' || !response.dataBase64) {
+          console.log(`[ChatTransfer] Page-context download failed for harvested URL (${response.error}), trying background fetch…`);
+          response = await requestAttachmentDownload('DOWNLOAD_ATTACHMENT_URL', harvested.url);
+        }
 
         if (response.status !== 'success' || !response.dataBase64) continue;
 
@@ -402,14 +412,18 @@ if (!window.__chatTransferSourceRegistered) {
                   );
                 });
                 capturedBlobCount = blobs.length;
+                sendResponse({
+                  status: 'success',
+                  data: fullConversation,
+                  capturedAttachments: capturedBlobCount
+                });
+                return;
               }
 
-              sendResponse({
-                status: 'success',
-                data: fullConversation,
-                capturedAttachments: capturedBlobCount
-              });
-              return;
+              console.warn(
+                '[ChatTransfer] Transcript storage failed during attachment capture; falling back to transcript-only storage.',
+                storeResp
+              );
             }
           } catch (blobErr) {
             console.warn('[ChatTransfer] Attachment capture failed (non-fatal):', blobErr);
