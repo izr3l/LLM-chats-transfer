@@ -10,6 +10,31 @@ export interface AttachmentRef {
   url?: string;
   mimeType?: string;
   sourceHint?: string;
+  /** Numeric alias used as a placeholder in transcript text; stripped on paste (user must re-upload files manually). */
+  blobAlias?: number;
+  /** Size in bytes of the captured blob (for display purposes). */
+  blobSize?: number;
+  /** Inline text content extracted directly from the DOM (for files rendered in-page). */
+  textContent?: string;
+}
+
+/**
+ * A captured attachment blob stored separately in IndexedDB.
+ * Linked to an AttachmentRef via its blobAlias within a transfer session.
+ */
+export interface AttachmentBlob {
+  /** The transfer ID this blob belongs to. */
+  transferId: string;
+  /** Numeric alias matching AttachmentRef.blobAlias. */
+  alias: number;
+  /** Original filename. */
+  name: string;
+  /** MIME type. */
+  mimeType: string;
+  /** File data as base64. */
+  dataBase64: string;
+  /** Size in bytes. */
+  size: number;
 }
 
 export interface Message {

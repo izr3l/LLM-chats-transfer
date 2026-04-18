@@ -21,7 +21,35 @@
     "https://qwenlm.ai/*",
     "https://www.perplexity.ai/*",
     "https://x.com/i/grok*",
-    "https://api.groq.com/*"
+    "https://api.groq.com/*",
+    "https://api.openai.com/*",
+    "https://*.oaiusercontent.com/*",
+    "https://*.googleapis.com/*",
+    "https://*.googleusercontent.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://gemini.google.com/*",
+        "https://manus.im/*",
+        "https://www.manus.im/*",
+        "https://manus.com/*",
+        "https://www.manus.com/*",
+        "https://manus.ai/*",
+        "https://www.manus.ai/*",
+        "https://manus.computer/*",
+        "https://www.manus.computer/*",
+        "https://chat.qwen.ai/*",
+        "https://qwen.ai/*",
+        "https://qwenlm.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://x.com/i/grok*"
+      ],
+      "js": ["content-toolbar.js"],
+      "run_at": "document_idle"
+    }
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none';"
