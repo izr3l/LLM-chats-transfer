@@ -1,9 +1,42 @@
 // Background script handles cross-tab messages and encrypted persistence.
 // Security fixes: VULN-02, VULN-03, VULN-04, VULN-09, VULN-10, VULN-11
 
-import { CanonicalConversation, isValidCanonicalConversation, MAX_PAYLOAD_SIZE } from '../schema/canonical';
+import { AttachmentBlob, CanonicalConversation, isValidCanonicalConversation, MAX_PAYLOAD_SIZE } from '../schema/canonical';
+import { putBlobs, getBlobsByTransfer, getBlob, deleteBlobsByTransfer } from './attachmentStore';
 
 type EncryptedPacket = { iv: string; ciphertext: string };
+
+// ===== AI PROVIDER TABLE =====
+// All providers expose an OpenAI-compatible chat completions API,
+// so one fetch call covers all of them — no separate adapters needed.
+type ProviderConfig = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  envKey: string | undefined;
+};
+
+const AI_PROVIDERS: Record<string, ProviderConfig> = {
+  groq: {
+    id: 'groq',
+    name: 'Groq',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    model: 'llama-3.3-70b-versatile',
+    envKey: process.env.GROQ_API_KEY,
+  },
+  openai: {
+    id: 'openai',
+    name: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-5.4-nano',
+    envKey: process.env.OPENAI_API_KEY,
+  },
+};
+
+const DEFAULT_PROVIDER_ID = 'groq';
+
+type StoredAiConfig = { providerId: string; encryptedKey?: EncryptedPacket };
 
 type TransferHistoryEntry = {
   id: string;
@@ -150,6 +183,50 @@ async function encryptPayload(payload: unknown): Promise<{ iv: string; ciphertex
   };
 }
 
+// Encrypt / decrypt raw strings (used for API keys)
+async function encryptString(text: string): Promise<EncryptedPacket> {
+  const key = await getOrCreateEncryptionKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encoded = new TextEncoder().encode(text);
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+  return { iv: bytesToBase64(iv), ciphertext: bytesToBase64(new Uint8Array(encrypted)) };
+}
+
+async function decryptString(packet: EncryptedPacket): Promise<string> {
+  const key = await getOrCreateEncryptionKey();
+  const ivBytes = base64ToBytes(packet.iv);
+  const ciphertextBytes = base64ToBytes(packet.ciphertext);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: toArrayBuffer(ivBytes) },
+    key,
+    toArrayBuffer(ciphertextBytes)
+  );
+  return new TextDecoder().decode(decrypted);
+}
+
+// Resolve active provider config + decrypted API key
+async function getActiveAiConfig(): Promise<{ provider: ProviderConfig; apiKey: string } | null> {
+  const result = await chrome.storage.local.get(['aiConfig']);
+  const stored = result.aiConfig as StoredAiConfig | undefined;
+
+  const providerId = stored?.providerId ?? DEFAULT_PROVIDER_ID;
+  const provider = AI_PROVIDERS[providerId] ?? AI_PROVIDERS[DEFAULT_PROVIDER_ID];
+
+  // Prefer user's encrypted key
+  if (stored?.encryptedKey && isEncryptedPacket(stored.encryptedKey)) {
+    try {
+      const apiKey = await decryptString(stored.encryptedKey);
+      if (apiKey.trim()) return { provider, apiKey: apiKey.trim() };
+    } catch { /* fall through */ }
+  }
+
+  // Fall back to env var for the selected provider
+  const envKey = provider.envKey;
+  if (envKey?.trim()) return { provider, apiKey: envKey.trim() };
+
+  return null;
+}
+
 // --- VULN-04: Schema validation after decryption ---
 async function decryptPayload(encryptedPacket: EncryptedPacket | undefined): Promise<CanonicalConversation | null> {
   if (!encryptedPacket) {
@@ -276,12 +353,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         const historyEntry = toHistoryEntry(request.payload as CanonicalConversation, encryptedTranscript);
         const existingHistory = await getHistory();
-        const nextHistory = [historyEntry, ...existingHistory].slice(0, 30);
 
+        // If a chat with the same source + title already exists, replace it
+        const duplicateIndex = existingHistory.findIndex(
+          (entry) => entry.source === historyEntry.source && entry.title === historyEntry.title
+        );
+        let nextHistory: TransferHistoryEntry[];
+        if (duplicateIndex >= 0) {
+          // Remove the old duplicate, then prepend the new one
+          existingHistory.splice(duplicateIndex, 1);
+          nextHistory = [historyEntry, ...existingHistory].slice(0, 30);
+        } else {
+          nextHistory = [historyEntry, ...existingHistory].slice(0, 30);
+        }
+
+        const payloadMeta = request.payload as CanonicalConversation;
         await chrome.storage.local.set({
           pendingTransferEncrypted: encryptedTranscript,
           activeTransferId: transferId,
-          transferHistory: nextHistory
+          transferHistory: nextHistory,
+          pendingTransferMeta: {
+            source: payloadMeta.metadata.source ?? 'unknown',
+            title: payloadMeta.metadata.title ?? 'Untitled'
+          }
         });
 
         sendResponse({ status: 'success', transferId });
@@ -328,9 +422,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === 'HAS_TRANSCRIPT') {
     (async () => {
-      const result = await chrome.storage.local.get(['pendingTransferEncrypted']);
+      const result = await chrome.storage.local.get(['pendingTransferEncrypted', 'pendingTransferMeta']);
       const hasTranscript = Boolean(result.pendingTransferEncrypted);
-      sendResponse({ hasTranscript });
+      const meta = hasTranscript && result.pendingTransferMeta ? result.pendingTransferMeta as { source: string; title: string } : null;
+      sendResponse({ hasTranscript, meta });
     })();
 
     return true;
@@ -371,7 +466,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       await chrome.storage.local.set({
         pendingTransferEncrypted: item.encrypted,
-        activeTransferId: transferId
+        activeTransferId: transferId,
+        pendingTransferMeta: {
+          source: item.source,
+          title: item.title
+        }
       });
       sendResponse({ status: 'success', transferId });
     })();
@@ -417,7 +516,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // --- Summarize: Calls Groq AI to summarize the captured transcript ---
+  // --- Summarize: Uses active AI provider (Groq or OpenAI — identical OpenAI-compatible API) ---
   if (request.type === 'SUMMARIZE_TRANSCRIPT') {
     (async () => {
       try {
@@ -441,22 +540,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           conversationText += `[${msg.role.toUpperCase()} - Message ${i + 1}]\n${text}\n\n`;
         });
 
-        // Truncate if excessively long to stay within model context
         const MAX_CHARS = 60000;
         if (conversationText.length > MAX_CHARS) {
           conversationText = conversationText.slice(0, MAX_CHARS) + '\n\n[... truncated for length ...]';
         }
 
-        const GROQ_API_KEY = process.env.GROQ_API_KEY;
+        // Resolve provider + API key (user encrypted key → env var fallback)
+        const aiConfig = await getActiveAiConfig();
+        if (!aiConfig) {
+          sendResponse({ status: 'error', error: 'No AI provider configured. Add an API key in Settings (gear icon).' });
+          return;
+        }
+        const { provider, apiKey } = aiConfig;
 
-        const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        const aiResponse = await fetch(`${provider.baseUrl}/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${GROQ_API_KEY}`
+            'Authorization': `Bearer ${apiKey}`
           },
           body: JSON.stringify({
-            model: 'llama-3.3-70b-versatile',
+            model: provider.model,
             messages: [
               {
                 role: 'system',
@@ -476,23 +580,25 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
               }
             ],
             temperature: 0.3,
-            max_tokens: 3000
+            ...(provider.id === 'openai'
+              ? { max_completion_tokens: 3000 }
+              : { max_tokens: 3000 })
           })
         });
 
-        if (!groqResponse.ok) {
-          const errorBody = await groqResponse.text();
-          sendResponse({ status: 'error', error: `Groq API error (${groqResponse.status}): ${errorBody}` });
+        if (!aiResponse.ok) {
+          const errorBody = await aiResponse.text();
+          sendResponse({ status: 'error', error: `${provider.name} API error (${aiResponse.status}): ${errorBody}` });
           return;
         }
 
-        const groqData = await groqResponse.json() as {
+        const aiData = await aiResponse.json() as {
           choices?: Array<{ message?: { content?: string } }>;
         };
 
-        const summary = groqData.choices?.[0]?.message?.content ?? '';
+        const summary = aiData.choices?.[0]?.message?.content ?? '';
         if (!summary) {
-          sendResponse({ status: 'error', error: 'Groq returned an empty summary.' });
+          sendResponse({ status: 'error', error: `${provider.name} returned an empty summary.` });
           return;
         }
 
@@ -501,13 +607,450 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
           summary,
           source: transcript.metadata.source,
           title: transcript.metadata.title ?? 'Untitled',
-          messageCount: transcript.messages.length
+          messageCount: transcript.messages.length,
+          providerName: provider.name
         });
       } catch (error) {
         sendResponse({ status: 'error', error: String(error) });
       }
     })();
 
+    return true;
+  }
+
+  // --- Save AI config (provider + encrypted API key) ---
+  if (request.type === 'SAVE_AI_CONFIG') {
+    (async () => {
+      try {
+        const providerId = typeof request.providerId === 'string' && AI_PROVIDERS[request.providerId]
+          ? request.providerId
+          : DEFAULT_PROVIDER_ID;
+        const plainApiKey = typeof request.apiKey === 'string' ? request.apiKey.trim() : '';
+
+        const stored: StoredAiConfig = { providerId };
+        if (plainApiKey) {
+          stored.encryptedKey = await encryptString(plainApiKey);
+        }
+        await chrome.storage.local.set({ aiConfig: stored });
+        sendResponse({ status: 'success' });
+      } catch (error) {
+        sendResponse({ status: 'error', error: String(error) });
+      }
+    })();
+    return true;
+  }
+
+  // --- Get AI config metadata (never exposes the raw key) ---
+  if (request.type === 'GET_AI_CONFIG_META') {
+    (async () => {
+      const result = await chrome.storage.local.get(['aiConfig']);
+      const stored = result.aiConfig as StoredAiConfig | undefined;
+      const providerId = stored?.providerId ?? DEFAULT_PROVIDER_ID;
+      const hasKey = Boolean(stored?.encryptedKey && isEncryptedPacket(stored.encryptedKey));
+      sendResponse({ status: 'success', providerId, hasKey });
+    })();
+    return true;
+  }
+
+  // --- Remove AI config key (keeps provider selection, reverts to env var fallback) ---
+  if (request.type === 'REMOVE_AI_CONFIG') {
+    (async () => {
+      const result = await chrome.storage.local.get(['aiConfig']);
+      const stored = result.aiConfig as StoredAiConfig | undefined;
+      await chrome.storage.local.set({ aiConfig: { providerId: stored?.providerId ?? DEFAULT_PROVIDER_ID } });
+      sendResponse({ status: 'success' });
+    })();
+    return true;
+  }
+
+  // --- Store captured attachment blobs into IndexedDB ---
+  if (request.type === 'STORE_ATTACHMENTS') {
+    (async () => {
+      try {
+        const transferId = typeof request.transferId === 'string' ? request.transferId : '';
+        const blobs = Array.isArray(request.blobs) ? request.blobs as AttachmentBlob[] : [];
+
+        if (!transferId) {
+          sendResponse({ status: 'error', error: 'Missing transferId.' });
+          return;
+        }
+        if (blobs.length === 0) {
+          sendResponse({ status: 'success', stored: 0 });
+          return;
+        }
+
+        // Tag each blob with the transfer ID
+        const tagged = blobs.map((b) => ({ ...b, transferId }));
+        await putBlobs(tagged);
+        sendResponse({ status: 'success', stored: tagged.length });
+      } catch (error) {
+        sendResponse({ status: 'error', error: String(error) });
+      }
+    })();
+    return true;
+  }
+
+  // --- Fetch all attachment blobs for the active transfer ---
+  if (request.type === 'FETCH_ATTACHMENTS') {
+    (async () => {
+      try {
+        const result = await chrome.storage.local.get(['activeTransferId']);
+        const transferId = typeof request.transferId === 'string'
+          ? request.transferId
+          : (typeof result.activeTransferId === 'string' ? result.activeTransferId : '');
+
+        if (!transferId) {
+          sendResponse({ blobs: [] });
+          return;
+        }
+
+        const blobs = await getBlobsByTransfer(transferId);
+        sendResponse({ blobs });
+      } catch (error) {
+        sendResponse({ blobs: [], error: String(error) });
+      }
+    })();
+    return true;
+  }
+
+  // --- Fetch a single attachment blob by alias ---
+  if (request.type === 'FETCH_ATTACHMENT') {
+    (async () => {
+      try {
+        const result = await chrome.storage.local.get(['activeTransferId']);
+        const transferId = typeof request.transferId === 'string'
+          ? request.transferId
+          : (typeof result.activeTransferId === 'string' ? result.activeTransferId : '');
+        const alias = typeof request.alias === 'number' ? request.alias : -1;
+
+        if (!transferId || alias < 0) {
+          sendResponse({ blob: null });
+          return;
+        }
+
+        const blob = await getBlob(transferId, alias);
+        sendResponse({ blob: blob ?? null });
+      } catch (error) {
+        sendResponse({ blob: null, error: String(error) });
+      }
+    })();
+    return true;
+  }
+
+  // --- Download a file from URL (used by content scripts for cross-origin attachment fetching) ---
+  if (request.type === 'DOWNLOAD_ATTACHMENT_URL') {
+    (async () => {
+      try {
+        const url = typeof request.url === 'string' ? request.url : '';
+        if (!url) {
+          sendResponse({ status: 'error', error: 'Missing URL.' });
+          return;
+        }
+
+        // Validate URL against allowed attachment hosts
+        let hostname: string;
+        try {
+          hostname = new URL(url).hostname;
+        } catch {
+          sendResponse({ status: 'error', error: 'Invalid URL.' });
+          return;
+        }
+
+        const ATTACHMENT_HOSTS = [
+          'oaiusercontent.com',
+          'files.oaiusercontent.com',
+          'chatgpt.com',
+          'chat.openai.com',
+          'claude.ai',
+          'gemini.google.com',
+          'googleapis.com',
+          'googleusercontent.com',
+          'manus.im',
+          'manus.com',
+          'manus.ai',
+          'perplexity.ai',
+          'qwen.ai',
+        ];
+
+        const isAllowed = ATTACHMENT_HOSTS.some(
+          (h) => hostname === h || hostname.endsWith(`.${h}`)
+        );
+
+        if (!isAllowed) {
+          sendResponse({ status: 'error', error: `Host "${hostname}" is not in the attachment allowlist.` });
+          return;
+        }
+
+        const resp = await fetch(url, { credentials: 'omit' });
+        if (!resp.ok) {
+          sendResponse({ status: 'error', error: `HTTP ${resp.status}: ${resp.statusText}` });
+          return;
+        }
+
+        const contentType = resp.headers.get('Content-Type') ?? 'application/octet-stream';
+        const buffer = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+
+        // Convert to base64
+        let binary = '';
+        bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+        const dataBase64 = btoa(binary);
+
+        // Try to extract filename from Content-Disposition
+        let filename = '';
+        const disposition = resp.headers.get('Content-Disposition') ?? '';
+        if (disposition) {
+          // Try RFC 5987 extended notation first
+          const extMatch = /filename\*\s*=\s*(?:UTF-8|utf-8)'[^']*'([^\s;]+)/i.exec(disposition);
+          if (extMatch) {
+            filename = decodeURIComponent(extMatch[1]);
+          } else {
+            // Standard filename="..." or filename=...
+            const stdMatch = /filename\s*=\s*"?([^";\n]+)"?/i.exec(disposition);
+            if (stdMatch) filename = stdMatch[1].trim();
+          }
+        }
+
+        // Fall back to URL path
+        if (!filename) {
+          try {
+            const urlPath = new URL(url).pathname;
+            const seg = urlPath.split('/').pop();
+            if (seg && seg.includes('.')) filename = decodeURIComponent(seg);
+          } catch { /* ignore */ }
+        }
+
+        if (!filename) filename = 'attachment';
+
+        sendResponse({
+          status: 'success',
+          dataBase64,
+          mimeType: contentType.split(';')[0].trim(),
+          filename,
+          size: bytes.length
+        });
+      } catch (error) {
+        sendResponse({ status: 'error', error: String(error) });
+      }
+    })();
+    return true;
+  }
+
+  // --- Harvest attachment URLs from React fiber tree (MAIN world injection) ---
+  if (request.type === 'HARVEST_FIBER_URLS') {
+    (async () => {
+      try {
+        const tabId = typeof request.tabId === 'number' ? request.tabId : sender.tab?.id;
+        if (!tabId) {
+          sendResponse({ status: 'error', error: 'No tab ID available.' });
+          return;
+        }
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: () => {
+            // Inline harvester that runs in MAIN world (has access to React internals)
+            const ALLOWED_HOSTS = [
+              'oaiusercontent.com', 'files.oaiusercontent.com',
+              'chatgpt.com', 'chat.openai.com',
+              'claude.ai', 'gemini.google.com',
+              'googleapis.com', 'googleusercontent.com',
+            ];
+
+            function isAllowed(url: string): boolean {
+              try {
+                const h = new URL(url).hostname;
+                return ALLOWED_HOSTS.some((a) => h === a || h.endsWith(`.${a}`));
+              } catch { return false; }
+            }
+
+            function isAttUrl(url: string): boolean {
+              if (!url || typeof url !== 'string' || !url.startsWith('https://')) return false;
+              if (!isAllowed(url)) return false;
+              if (/\/(avatar|icon|favicon|thumbnail|thumb|logo)/i.test(url)) return false;
+              return true;
+            }
+
+            const found = new Map<string, { url: string; name?: string; mimeType?: string }>();
+            const MAX_FIBERS = 15000;
+            const MAX_DEPTH = 20;
+            let fc = 0;
+
+            function scan(obj: unknown, depth: number, vis: Set<unknown>): void {
+              if (depth > MAX_DEPTH || vis.size > 5000) return;
+              if (!obj || typeof obj !== 'object') return;
+              if (vis.has(obj)) return;
+              vis.add(obj);
+              const r = obj as Record<string, unknown>;
+              // Check all URL-like keys specific to file attachments
+              const URL_KEYS = ['url', 'download_url', 'downloadUrl', 'file_url', 'fileUrl',
+                'signedUrl', 'signed_url', 'asset_pointer', 'src', 'href'];
+              for (const uk of URL_KEYS) {
+                const v = r[uk];
+                if (typeof v === 'string' && v.startsWith('https://') && isAttUrl(v) && !found.has(v)) {
+                  const nm = typeof r['name'] === 'string' ? r['name']
+                    : typeof r['fileName'] === 'string' ? r['fileName']
+                    : typeof r['file_name'] === 'string' ? r['file_name']
+                    : typeof r['title'] === 'string' ? r['title'] : undefined;
+                  const mt = typeof r['mimeType'] === 'string' ? r['mimeType']
+                    : typeof r['content_type'] === 'string' ? r['content_type']
+                    : typeof r['mime_type'] === 'string' ? r['mime_type'] : undefined;
+                  found.set(v, { url: v, name: nm, mimeType: mt });
+                }
+              }
+              // Also check ChatGPT's asset_pointer pattern: file-service://file-xxxx
+              if (typeof r['asset_pointer'] === 'string' && (r['asset_pointer'] as string).startsWith('file-service://')) {
+                // The actual download URL may be in a sibling key
+                const dlUrl = r['download_url'] || r['downloadUrl'] || r['url'];
+                if (typeof dlUrl === 'string' && dlUrl.startsWith('https://')) {
+                  if (!found.has(dlUrl)) {
+                    found.set(dlUrl, {
+                      url: dlUrl,
+                      name: typeof r['file_name'] === 'string' ? r['file_name'] : typeof r['name'] === 'string' ? r['name'] : undefined,
+                      mimeType: typeof r['mime_type'] === 'string' ? r['mime_type'] : typeof r['mimeType'] === 'string' ? r['mimeType'] : undefined
+                    });
+                  }
+                }
+              }
+              for (const k of Object.keys(r)) {
+                const v = r[k];
+                if (typeof v === 'string' && v.startsWith('https://') && isAttUrl(v) && !found.has(v)) {
+                  const nm = typeof r['name'] === 'string' ? r['name']
+                    : typeof r['fileName'] === 'string' ? r['fileName']
+                    : typeof r['file_name'] === 'string' ? r['file_name']
+                    : typeof r['title'] === 'string' ? r['title'] : undefined;
+                  const mt = typeof r['mimeType'] === 'string' ? r['mimeType']
+                    : typeof r['content_type'] === 'string' ? r['content_type']
+                    : typeof r['mime_type'] === 'string' ? r['mime_type'] : undefined;
+                  found.set(v, { url: v, name: nm, mimeType: mt });
+                } else if (typeof v === 'object' && v !== null) {
+                  scan(v, depth + 1, vis);
+                }
+              }
+            }
+
+            function walk(fiber: Record<string, unknown> | null, vis: Set<unknown>): void {
+              if (!fiber || typeof fiber !== 'object' || vis.has(fiber) || fc++ > MAX_FIBERS) return;
+              vis.add(fiber);
+              for (const pk of ['memoizedProps', 'pendingProps']) {
+                const p = fiber[pk];
+                if (p && typeof p === 'object') scan(p, 0, new Set());
+              }
+              // Also scan stateNode (component instance state)
+              const st = fiber['memoizedState'];
+              if (st && typeof st === 'object') scan(st, 0, new Set());
+              const sn = fiber['stateNode'];
+              if (sn && typeof sn === 'object' && !(sn instanceof HTMLElement)) scan(sn, 0, new Set());
+              walk(fiber['child'] as Record<string, unknown> | null, vis);
+              walk(fiber['sibling'] as Record<string, unknown> | null, vis);
+            }
+
+            const sels = [
+              'article[data-testid^="conversation-turn-"]',
+              '[data-message-author-role]', '[data-testid*="message"]',
+              'main article',
+            ];
+            const els = new Set<Element>();
+            for (const s of sels) document.querySelectorAll(s).forEach((e) => els.add(e));
+            const root = document.getElementById('__next') || document.getElementById('root');
+            if (root) els.add(root);
+
+            for (const el of els) {
+              for (const k of Object.keys(el)) {
+                if (k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')) {
+                  walk((el as unknown as Record<string, unknown>)[k] as Record<string, unknown>, new Set());
+                }
+                if (k.startsWith('__reactProps$')) {
+                  const p = (el as unknown as Record<string, unknown>)[k];
+                  if (p && typeof p === 'object') scan(p, 0, new Set());
+                }
+              }
+            }
+
+            // Also scan __NEXT_DATA__
+            try {
+              const nd = document.getElementById('__NEXT_DATA__');
+              if (nd?.textContent) scan(JSON.parse(nd.textContent), 0, new Set());
+            } catch { /* ignore */ }
+
+            return Array.from(found.values());
+          }
+        });
+
+        const harvested = results?.[0]?.result as Array<{ url: string; name?: string; mimeType?: string }> | null;
+        sendResponse({ status: 'success', urls: harvested ?? [] });
+      } catch (error) {
+        sendResponse({ status: 'error', error: String(error), urls: [] });
+      }
+    })();
+    return true;
+  }
+
+  // --- Download an attachment in the PAGE context (MAIN world) with the user's cookies ---
+  if (request.type === 'DOWNLOAD_IN_PAGE') {
+    (async () => {
+      try {
+        const url = typeof request.url === 'string' ? request.url : '';
+        if (!url) { sendResponse({ status: 'error', error: 'Missing URL.' }); return; }
+
+        const tabId = typeof request.tabId === 'number' ? request.tabId : sender.tab?.id;
+        if (!tabId) { sendResponse({ status: 'error', error: 'No tab ID.' }); return; }
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          args: [url],
+          func: async (fileUrl: string) => {
+            try {
+              const resp = await fetch(fileUrl, { credentials: 'include' });
+              if (!resp.ok) return { status: 'error', error: `HTTP ${resp.status}` };
+
+              const contentType = resp.headers.get('Content-Type') ?? 'application/octet-stream';
+              const buffer = await resp.arrayBuffer();
+              const bytes = new Uint8Array(buffer);
+
+              // Convert to base64 (accumulate binary string then btoa)
+              let bin = '';
+              for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+              const dataBase64 = btoa(bin);
+
+              let filename = '';
+              const disposition = resp.headers.get('Content-Disposition') ?? '';
+              if (disposition) {
+                const m = /filename\*\s*=\s*(?:UTF-8|utf-8)'[^']*'([^\s;]+)/i.exec(disposition)
+                  || /filename\s*=\s*"?([^";\n]+)"?/i.exec(disposition);
+                if (m) filename = decodeURIComponent(m[1].trim());
+              }
+              if (!filename) {
+                try {
+                  const seg = new URL(fileUrl).pathname.split('/').pop();
+                  if (seg && seg.includes('.')) filename = decodeURIComponent(seg);
+                } catch { /* */ }
+              }
+
+              return {
+                status: 'success',
+                dataBase64,
+                mimeType: contentType.split(';')[0].trim(),
+                filename: filename || 'attachment',
+                size: bytes.length
+              };
+            } catch (e) {
+              return { status: 'error', error: String(e) };
+            }
+          }
+        });
+
+        const result = results?.[0]?.result as {
+          status: string; dataBase64?: string; mimeType?: string; filename?: string; size?: number; error?: string;
+        } | null;
+
+        sendResponse(result ?? { status: 'error', error: 'Script returned nothing.' });
+      } catch (error) {
+        sendResponse({ status: 'error', error: String(error) });
+      }
+    })();
     return true;
   }
 });

@@ -24,12 +24,11 @@ export class GenericTargetAdapter implements TargetAdapter {
     }
 
     const lines = msg.attachments.map((attachment) => {
-      const label = attachment.name ? ` ${attachment.name}` : '';
-      const url = attachment.url ? ` (${attachment.url})` : '';
-      return `- [${attachment.kind}]${label}${url}`;
+      const label = attachment.name || 'unnamed file';
+      return `- [${attachment.kind}] ${label}`;
     });
 
-    return `Attachments:\n${lines.join('\n')}\n`;
+    return `Attachments (not auto-uploaded — user must re-upload manually):\n${lines.join('\n')}\n`;
   }
 
   public generateSingleShotPrompt(conversation: CanonicalConversation): string {
@@ -45,7 +44,7 @@ export class GenericTargetAdapter implements TargetAdapter {
       }
     });
     promptText += `--- TRANSCRIPT END ---\n\n`;
-    promptText += `If attachments are listed above, treat them as references from the original chat and mention when manual re-upload is needed for strict fidelity.\n\n`;
+    promptText += `IMPORTANT: Some messages in this transcript had file attachments. These files could NOT be automatically uploaded to this chat. The attachment names are listed under each message. If the user needs the LLM to reference those files, they must manually upload them here.\n\n`;
     promptText += `Now continue with the best possible answer to the last user message.`;
     return promptText;
   }
