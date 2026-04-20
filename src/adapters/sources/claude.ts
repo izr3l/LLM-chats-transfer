@@ -290,6 +290,10 @@ export class ClaudeAdapter implements SourceAdapter {
       '[data-testid*="message"]',
       'main [class*="font-user-message"]',
       'main [class*="font-claude-message"]',
+      'main [class*="font-claude-response"]',
+      '[class*="font-user-message"]',
+      '[class*="font-claude-message"]',
+      '[class*="font-claude-response"]',
       'main .prose'
     ];
     const uniqueNodes: HTMLElement[] = [];

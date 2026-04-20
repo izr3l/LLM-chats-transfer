@@ -340,7 +340,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Initialise: detect active tab + check pending transcript in parallel
-  async function initPageDetect() {
+  async function initPageDetect(skipStatusMsg = false) {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const activeUrl = tabs[0]?.url ?? '';
     const provider = getProviderName(activeUrl);
@@ -352,15 +352,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (hasTranscript) {
         injectBtn.disabled = false;
-        if (!provider) {
-          // No recognised page — show generic pending message in status
-          statusDiv.textContent = `${transcriptSource ?? 'Chat'} chat captured — open a target tab to paste.`;
-          statusDiv.className = 'status-box status success';
-        } else {
-          statusDiv.textContent = 'Ready to capture or paste a chat.';
-          statusDiv.className = 'status-box status success';
+        if (!skipStatusMsg) {
+          if (!provider) {
+            // No recognised page — show generic pending message in status
+            statusDiv.textContent = `${transcriptSource ?? 'Chat'} chat captured — open a target tab to paste.`;
+            statusDiv.className = 'status-box status success';
+          } else {
+            statusDiv.textContent = `${transcriptSource ?? 'Chat'} chat captured — ready to paste or capture another.`;
+            statusDiv.className = 'status-box status success';
+          }
         }
-      } else if (provider) {
+      } else if (provider && !skipStatusMsg) {
         statusDiv.textContent = 'Ready. Capture a chat or paste a previously captured one.';
         statusDiv.className = 'status-box status';
       }
@@ -398,7 +400,7 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshHistory();
         runSummarize(true);
         // Refresh page detect strip with new transcript source
-        void initPageDetect();
+        void initPageDetect(true);
       } else {
         const errMsg = typeof response.error === 'string' ? response.error : 'Extraction failed.';
         if (errMsg.includes('Receiving end does not exist')) {

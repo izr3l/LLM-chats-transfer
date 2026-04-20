@@ -1,6 +1,4 @@
 // Content script: Target injection
-// VULN-05: Integrity verification before injection
-// VULN-07: Idempotency guard for programmatic injection
 
 import { TargetAdapter } from '../adapters/targets';
 import { ChatGPTAdapter } from '../adapters/targets/chatgpt';
@@ -14,7 +12,6 @@ declare global {
   }
 }
 
-// --- VULN-05: SHA-256 integrity verification ---
 
 function bytesToHex(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -135,7 +132,7 @@ function getAdapter(): TargetAdapter {
       'div[role="textbox"]'
     ]);
   }
-  
+
   throw new Error(`Unsupported target: ${host}`);
 }
 
@@ -148,17 +145,16 @@ if (!window.__chatTransferTargetRegistered) {
       (async () => {
         try {
           const adapter = getAdapter();
-          
+
           // Request pending transcript from Service Worker storage
           chrome.runtime.sendMessage({ type: 'FETCH_TRANSCRIPT' }, async (response) => {
             const transcript = response?.payload as CanonicalConversation | null;
-            
+
             if (!transcript) {
               sendResponse({ status: 'error', error: 'No pending transcript found.' });
               return;
             }
 
-            // --- VULN-05: Verify integrity hash before injection ---
             const integrityValid = await verifyIntegrity(transcript);
             if (!integrityValid) {
               sendResponse({
@@ -261,7 +257,7 @@ if (!window.__chatTransferTargetRegistered) {
 
           // Decode base64 → File
           const binary = atob(base64);
-          const bytes  = new Uint8Array(binary.length);
+          const bytes = new Uint8Array(binary.length);
           for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
           const file = new File([bytes.buffer as ArrayBuffer], filename, { type: mimeType });
 

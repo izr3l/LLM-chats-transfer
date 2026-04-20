@@ -1,5 +1,4 @@
 // Content script: Source extraction
-// VULN-07: Idempotency guard for programmatic injection
 
 import { SourceAdapter } from '../adapters/sources';
 import { ClaudeAdapter } from '../adapters/sources/claude';
@@ -322,7 +321,7 @@ function getAdapter(): SourceAdapter {
       'article'
     ]);
   }
-  
+
   throw new Error(`Unsupported source: ${host}`);
 }
 

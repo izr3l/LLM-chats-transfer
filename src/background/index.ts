@@ -1,5 +1,4 @@
 // Background script handles cross-tab messages and encrypted persistence.
-// Security fixes: VULN-02, VULN-03, VULN-04, VULN-09, VULN-10, VULN-11
 
 import { AttachmentBlob, CanonicalConversation, isValidCanonicalConversation, MAX_PAYLOAD_SIZE } from '../schema/canonical';
 import { putBlobs, getBlobsByTransfer, getBlob, deleteBlobsByTransfer } from './attachmentStore';
@@ -49,7 +48,6 @@ type TransferHistoryEntry = {
   encrypted: EncryptedPacket;
 };
 
-// --- VULN-11: Rate limiter to prevent message flooding ---
 const rateLimiter = new Map<string, number>();
 const RATE_LIMIT_MS = 500;
 
@@ -61,7 +59,7 @@ function isRateLimited(type: string): boolean {
   return false;
 }
 
-// --- VULN-03: Sender origin validation ---
+
 const ALLOWED_ORIGINS = [
   'claude.ai',
   'chatgpt.com',
@@ -126,12 +124,6 @@ function isEncryptedPacket(value: unknown): value is EncryptedPacket {
   const maybePacket = value as { iv?: unknown; ciphertext?: unknown };
   return typeof maybePacket.iv === 'string' && typeof maybePacket.ciphertext === 'string';
 }
-
-// --- VULN-02: Persistent encryption key (survives browser restart) ---
-// The key is stored in chrome.storage.local. This is a defense-in-depth measure:
-// Chrome isolates extension storage per-extension, so the key is not readable by
-// other extensions. For stronger protection, implement passphrase-based key
-// derivation (PBKDF2) with a user-supplied passphrase.
 
 async function getOrCreateEncryptionKey(): Promise<CryptoKey> {
   const result = await chrome.storage.local.get(['encryptionKeyV2']);
@@ -227,7 +219,6 @@ async function getActiveAiConfig(): Promise<{ provider: ProviderConfig; apiKey: 
   return null;
 }
 
-// --- VULN-04: Schema validation after decryption ---
 async function decryptPayload(encryptedPacket: EncryptedPacket | undefined): Promise<CanonicalConversation | null> {
   if (!encryptedPacket) {
     return null;
@@ -315,14 +306,12 @@ function toHistoryEntry(payload: CanonicalConversation, encrypted: EncryptedPack
 // --- Main message handler ---
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // --- VULN-11: Rate limiting ---
   const messageType = typeof request?.type === 'string' ? request.type : '';
   if (messageType && isRateLimited(messageType)) {
     sendResponse({ status: 'error', error: 'Rate limited. Please wait.' });
     return true;
   }
 
-  // --- VULN-03: Sender validation ---
   if (!isAllowedSender(sender)) {
     sendResponse({ status: 'error', error: 'Unauthorized sender.' });
     return true;
@@ -331,13 +320,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'STORE_TRANSCRIPT') {
     (async () => {
       try {
-        // --- VULN-03: Schema validation on incoming payload ---
         if (!isValidCanonicalConversation(request.payload)) {
           sendResponse({ status: 'error', error: 'Invalid payload: schema validation failed.' });
           return;
         }
 
-        // --- VULN-03: Payload size limit ---
         const payloadSize = JSON.stringify(request.payload).length;
         if (payloadSize > MAX_PAYLOAD_SIZE) {
           sendResponse({ status: 'error', error: `Payload too large (${(payloadSize / 1024 / 1024).toFixed(1)} MB). Max is 5 MB.` });
@@ -346,7 +333,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         const encryptedTranscript = await encryptPayload(request.payload);
 
-        // --- VULN-09: Transfer session ID for atomic capture→inject link ---
         const transferId = typeof crypto.randomUUID === 'function'
           ? crypto.randomUUID()
           : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -392,7 +378,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       try {
         const result = await chrome.storage.local.get(['pendingTransferEncrypted', 'pendingTransfer']);
 
-        // --- VULN-10: Migrate old plaintext data forward instead of serving it raw ---
         if (result.pendingTransfer && !result.pendingTransferEncrypted) {
           try {
             const encrypted = await encryptPayload(result.pendingTransfer);
@@ -499,7 +484,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // --- VULN-12: Preview support — returns decrypted transcript for user review ---
   if (request.type === 'PREVIEW_TRANSCRIPT') {
     (async () => {
       try {
@@ -891,11 +875,11 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
                 if (typeof v === 'string' && v.startsWith('https://') && isAttUrl(v) && !found.has(v)) {
                   const nm = typeof r['name'] === 'string' ? r['name']
                     : typeof r['fileName'] === 'string' ? r['fileName']
-                    : typeof r['file_name'] === 'string' ? r['file_name']
-                    : typeof r['title'] === 'string' ? r['title'] : undefined;
+                      : typeof r['file_name'] === 'string' ? r['file_name']
+                        : typeof r['title'] === 'string' ? r['title'] : undefined;
                   const mt = typeof r['mimeType'] === 'string' ? r['mimeType']
                     : typeof r['content_type'] === 'string' ? r['content_type']
-                    : typeof r['mime_type'] === 'string' ? r['mime_type'] : undefined;
+                      : typeof r['mime_type'] === 'string' ? r['mime_type'] : undefined;
                   found.set(v, { url: v, name: nm, mimeType: mt });
                 }
               }
@@ -918,11 +902,11 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
                 if (typeof v === 'string' && v.startsWith('https://') && isAttUrl(v) && !found.has(v)) {
                   const nm = typeof r['name'] === 'string' ? r['name']
                     : typeof r['fileName'] === 'string' ? r['fileName']
-                    : typeof r['file_name'] === 'string' ? r['file_name']
-                    : typeof r['title'] === 'string' ? r['title'] : undefined;
+                      : typeof r['file_name'] === 'string' ? r['file_name']
+                        : typeof r['title'] === 'string' ? r['title'] : undefined;
                   const mt = typeof r['mimeType'] === 'string' ? r['mimeType']
                     : typeof r['content_type'] === 'string' ? r['content_type']
-                    : typeof r['mime_type'] === 'string' ? r['mime_type'] : undefined;
+                      : typeof r['mime_type'] === 'string' ? r['mime_type'] : undefined;
                   found.set(v, { url: v, name: nm, mimeType: mt });
                 } else if (typeof v === 'object' && v !== null) {
                   scan(v, depth + 1, vis);
