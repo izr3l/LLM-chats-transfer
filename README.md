@@ -36,7 +36,7 @@ To build and run this extension locally you need:
 
 1. **Clone the Repository:**
    ```bash
-   git clone https://github.com/izr3l/chat-transfer.git
+   git clone https://github.com/izr3l/LLM-chats-transfer.git
    cd LLM-chats-transfer
    ```
 
