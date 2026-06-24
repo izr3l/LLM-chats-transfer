@@ -36,7 +36,7 @@ To build and run this extension locally you need:
 
 1. **Clone the Repository:**
    ```bash
-   git clone https://github.com/your-username/chat-transfer.git
+   git clone https://github.com/izr3l/chat-transfer.git
    cd LLM-chats-transfer
    ```
 
@@ -124,7 +124,3 @@ Contributions, issues, and feature requests are welcome! If you plan to implemen
 2. Map it cleanly into the Universal Canonical Types located inside `src/schema/canonical.ts`.
 3. Add the supported origin domain mapping into `src/background/index.ts`.
 4. For attachment capture, add the provider's file-hosting domains to the allowlist in the `DOWNLOAD_ATTACHMENT_URL` handler.
-
-## 📄 License
-
-This project is licensed under the [ISC License](LICENSE).
