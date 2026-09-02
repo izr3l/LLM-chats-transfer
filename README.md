@@ -2,7 +2,7 @@
 
 LLM Chat Transfer is a powerful browser extension that enables you to extract your conversation history from one AI provider (like ChatGPT, Claude, or Gemini) seamlessly inject it into another or summarize it using Groq's high-performance LLM APIs, preserving message order, context, timestamps, and roles. This allows for frictionless context-switching between your favorite AI models!
 
-## ✨ Features
+## Features
 
 - **Cross-Platform Transfer:** Extract and inject conversations across multiple top-tier AI targets.
 - **Fidelity Preservation:** It captures conversation text, markdown, code blocks, timestamps, and roles using a normalized canonical schema.
@@ -14,7 +14,7 @@ LLM Chat Transfer is a powerful browser extension that enables you to extract yo
 - **In-Page Toolbar:** A floating toolbar (Shadow DOM isolated) appears on all supported provider pages with quick access to capture, paste, summarize, download, and history.
 - **History Viewer:** Easy-to-use clipboard interface within the extension to store multiple chats, switch between them, summarize, export, or delete.
 
-## 🔗 Supported Platforms
+## Supported Platforms
 
 The extension works on and supports extraction/injection for most primary AI interfaces including:
 - ChatGPT (`chatgpt.com`)
@@ -25,14 +25,14 @@ The extension works on and supports extraction/injection for most primary AI int
 - Perplexity (`perplexity.ai`)
 - Grok / X (`x.com`)
 
-## 🛠️ Prerequisites
+## Prerequisites
 
 To build and run this extension locally you need:
 - [Node.js](https://nodejs.org/) (v16 or higher recommended)
 - A Chromium-based browser (Chrome, Edge, Brave, etc.)
 - A [Groq API Key](https://console.groq.com/keys) if you wish to use the AI Summarization feature.
 
-## 🚀 Installation & Setup
+## Installation & Setup
 
 1. **Clone the Repository:**
    ```bash
@@ -61,14 +61,14 @@ To build and run this extension locally you need:
    ```
    *This process runs Webpack, transpiles the TypeScript, bundles the assets, and dumps the final, ready-to-use extension into the `dist/` directory.*
 
-## 🔌 Load Unpacked Extension
+## Load Unpacked Extension
 
 1. Open your Chromium-based browser and navigate to the Extensions page (for Chrome, visit `chrome://extensions`).
 2. Toggle on **Developer mode** in the top right corner.
 3. Click the **Load unpacked** button.
 4. Select the initialized `dist` folder located in your `chat-transfer` directory.
 
-## 📖 How to Use
+## How to Use
 
 1. **Capture Chat**: Open an interface containing your LLM chat (e.g., Claude), open the extension using the popup or the in-page floating toolbar, and click **Capture**. The extension extracts messages, detects file attachments, downloads them, and stores everything locally.
 2. **Review/Summarize**: A summary automatically runs in the background after capture. Click the summarize icon (✨) to view it, or use Re-summarize to force a fresh summary.
@@ -88,7 +88,7 @@ When you capture a chat, the extension:
 3. Stores binary data as base64 in IndexedDB, linked to the transfer by numeric aliases
 4. Lists attachment names in the transcript so you can identify which files to re-upload manually
 
-## 🛡️ Security Notes
+## Security Notes
 
 - This extension actively secures pending transfer data by utilizing Web Crypto AES-GCM local storage encryption preventing other script access.
 - Validates the hostname origin preventing side-channel cross-site injection attacks.
@@ -96,7 +96,7 @@ When you capture a chat, the extension:
 - Individual attachment size capped at 25 MB; total per-transfer capped at 200 MB.
 - IndexedDB storage is isolated per-extension by the browser sandbox.
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 src/
@@ -117,7 +117,7 @@ src/
     └── popup.ts        # Popup logic: capture, paste, history, download, settings
 ```
 
-## 🤝 Contributing
+## Contributing
 
 Contributions, issues, and feature requests are welcome! If you plan to implement new Provider Adapters:
 1. Try parsing directly via DOM selector layouts in `src/content/source.ts`.
