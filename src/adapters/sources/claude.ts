@@ -24,6 +24,14 @@ export class ClaudeAdapter implements SourceAdapter {
     return /(\.pdf|\.docx?|\.xlsx?|\.pptx?|\.txt|\.csv|\.json|\.zip|\.rar|\.7z|\.mp4|\.mp3|\.wav|\.mov|\.webm)(\?|#|$)/i.test(url);
   }
 
+  private isComposerNode(node: HTMLElement): boolean {
+    return Boolean(
+      node.closest(
+        'form, textarea, [contenteditable="true"], [role="textbox"], [data-testid*="composer"], [data-testid*="input"]'
+      )
+    );
+  }
+
   private extractAttachments(node: HTMLElement, messageIndex: number): AttachmentRef[] {
     const attachments: AttachmentRef[] = [];
     const seen = new Set<string>();
@@ -211,7 +219,7 @@ export class ClaudeAdapter implements SourceAdapter {
       const sibEl = sibling as HTMLElement;
       // Code block or pre following the chip
       if (sibEl.tagName === 'PRE' || sibEl.tagName === 'CODE' ||
-          sibEl.querySelector?.('pre, code, [class*="code-block"]')) {
+        sibEl.querySelector?.('pre, code, [class*="code-block"]')) {
         const text = sibEl.innerText?.trim() || '';
         if (text.length > 50) {
           return text.slice(0, MAX_CONTENT);
@@ -233,7 +241,7 @@ export class ClaudeAdapter implements SourceAdapter {
     for (let i = 0; i < 5 && wrapper; i++) {
       // Stop at message-level containers
       if (wrapper.getAttribute('data-message-author') || wrapper.getAttribute('data-role') ||
-          /\bmessage\b/i.test(wrapper.className || '')) {
+        /\bmessage\b/i.test(wrapper.className || '')) {
         break;
       }
       const wrapperText = wrapper.innerText?.trim() || '';
@@ -310,14 +318,12 @@ export class ClaudeAdapter implements SourceAdapter {
           return;
         }
 
-        if (uniqueNodes.some((existing) => existing.contains(node))) {
+        if (this.isComposerNode(node)) {
           return;
         }
 
-        for (let i = uniqueNodes.length - 1; i >= 0; i -= 1) {
-          if (node.contains(uniqueNodes[i])) {
-            uniqueNodes.splice(i, 1);
-          }
+        if (uniqueNodes.some((existing) => existing.contains(node) || node.contains(existing))) {
+          return;
         }
 
         uniqueNodes.push(node);

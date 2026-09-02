@@ -62,6 +62,14 @@ export class GenericFallbackAdapter implements SourceAdapter {
     return /(\.pdf|\.docx?|\.xlsx?|\.pptx?|\.txt|\.csv|\.json|\.zip|\.rar|\.7z|\.mp4|\.mp3|\.wav|\.mov|\.webm)(\?|#|$)/i.test(url);
   }
 
+  private isComposerNode(node: HTMLElement): boolean {
+    return Boolean(
+      node.closest(
+        'form, textarea, [contenteditable="true"], [role="textbox"], #prompt-textarea, [data-testid*="composer"], [data-testid*="input"]'
+      )
+    );
+  }
+
   private extractAttachments(node: HTMLElement, messageIndex: number): AttachmentRef[] {
     const attachments: AttachmentRef[] = [];
     const seen = new Set<string>();
@@ -295,14 +303,12 @@ export class GenericFallbackAdapter implements SourceAdapter {
           return;
         }
 
-        if (uniqueNodes.some((existing) => existing.contains(node))) {
+        if (this.isComposerNode(node)) {
           return;
         }
 
-        for (let i = uniqueNodes.length - 1; i >= 0; i -= 1) {
-          if (node.contains(uniqueNodes[i])) {
-            uniqueNodes.splice(i, 1);
-          }
+        if (uniqueNodes.some((existing) => existing.contains(node) || node.contains(existing))) {
+          return;
         }
 
         uniqueNodes.push(node);
