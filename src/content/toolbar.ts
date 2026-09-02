@@ -8,7 +8,7 @@ import { ManusAdapter } from '../adapters/sources/manus';
 import { ChatGPTAdapter } from '../adapters/targets/chatgpt';
 import { GenericTargetAdapter } from '../adapters/targets/fallback';
 import { ManusTargetAdapter } from '../adapters/targets/manus';
-import { CanonicalConversation } from '../schema/canonical';
+import { AttachmentBlob, CanonicalConversation } from '../schema/canonical';
 import {
   AttachFormat,
   DownloadFormat,
@@ -41,13 +41,26 @@ async function computeSha256(payload: string): Promise<string> {
 
 function msgBg<T = Record<string, unknown>>(msg: Record<string, unknown>): Promise<T> {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(msg, (resp) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message ?? 'Extension context error'));
-      } else {
-        resolve(resp as T);
+    const staleContextMessage = 'Extension was reloaded. Refresh this chat page, then use Capture again.';
+
+    try {
+      if (!chrome.runtime?.id) {
+        reject(new Error(staleContextMessage));
+        return;
       }
-    });
+
+      chrome.runtime.sendMessage(msg, (resp) => {
+        if (chrome.runtime.lastError) {
+          const raw = chrome.runtime.lastError.message ?? 'Extension context error';
+          reject(new Error(raw.includes('Extension context invalidated') ? staleContextMessage : raw));
+        } else {
+          resolve(resp as T);
+        }
+      });
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      reject(new Error(raw.includes('Extension context invalidated') ? staleContextMessage : raw));
+    }
   });
 }
 
@@ -59,8 +72,7 @@ function getSourceAdapter() {
   if (host.includes('chatgpt.com'))
     return new GenericFallbackAdapter('ChatGPT', [
       'article[data-testid^="conversation-turn-"]',
-      '[data-message-author-role]',
-      '#prompt-textarea'
+      '[data-message-author-role]'
     ]);
   if (host.includes('gemini.google.com'))
     return new GenericFallbackAdapter('Gemini', [
@@ -119,36 +131,22 @@ function getTargetAdapter(): import('../adapters/targets').TargetAdapter | null 
 // ─── Actions ──────────────────────────────────────────────────────────────────
 
 async function actionExtract(): Promise<string> {
-  const adapter = getSourceAdapter();
-  if (!adapter) throw new Error('This page is not supported for extraction.');
-
-  let conversation = adapter.extractConversation();
-  let count = conversation.messages.length;
-
-  if (count === 0) {
-    const broad = new GenericFallbackAdapter(window.location.hostname, [
-      '[data-testid*="message"]', '[data-testid*="chat"]', '[data-message-author]',
-      '[data-role]', '[class*="message"]', '[class*="chat"]',
-      'main article', 'main .prose', 'main p'
-    ]);
-    const fallback = broad.extractConversation();
-    if (fallback.messages.length > 0) { conversation = fallback; count = fallback.messages.length; }
-  }
-
-  if (count === 0) throw new Error('No messages found. Try scrolling through the full conversation first.');
-
-  if (!conversation.integrity) conversation.integrity = { messageCount: count };
-  conversation.integrity.sha256 = await computeSha256(
-    JSON.stringify({ metadata: conversation.metadata, messages: conversation.messages })
-  );
-
-  const result = await msgBg<{ status: string; error?: string }>({
-    type: 'STORE_TRANSCRIPT',
-    payload: conversation
-  });
+  const result = await msgBg<{
+    status: string;
+    error?: string;
+    data?: CanonicalConversation;
+    capturedAttachments?: number;
+  }>({ type: 'CAPTURE_ACTIVE_TAB' });
 
   if (result.status !== 'success') throw new Error(result.error ?? 'Failed to store transcript.');
-  return `${count} message${count !== 1 ? 's' : ''} captured from ${conversation.metadata.source}.`;
+  const conversation = result.data;
+  const count = conversation?.integrity?.messageCount ?? conversation?.messages.length ?? 0;
+  const source = conversation?.metadata.source ?? 'this page';
+  const captured = result.capturedAttachments ?? 0;
+  const attachmentText = captured > 0
+    ? ` and downloaded ${captured} file${captured !== 1 ? 's' : ''}`
+    : '';
+  return `${count} message${count !== 1 ? 's' : ''}${attachmentText} captured from ${source}.`;
 }
 
 async function actionPaste(): Promise<string> {
@@ -167,23 +165,35 @@ async function actionPaste(): Promise<string> {
   if (typeof adapter.injectViaFile === 'function') {
     success = await adapter.injectViaFile(transcript);
     if (!success) throw new Error('File attachment failed. Try clicking the chat input first and retry.');
-    return 'Transcript attached as a text file.';
+    return formatPasteResult('Transcript attached as a text file.', await attachCapturedFiles());
   }
 
   const prompt = adapter.generateSingleShotPrompt(transcript);
   success = adapter.injectPrompt(prompt);
   if (!success) throw new Error('Could not inject into the text box. Try clicking the input area first.');
-  return 'Chat injected into the text box.';
+  return formatPasteResult('Chat injected into the text box.', await attachCapturedFiles());
 }
 
 /** Try to attach a File object to the page via DataTransfer (file input or drag-drop). */
 function tryAttachFile(file: File): boolean {
+  return tryAttachFiles([file]);
+}
+
+function tryAttachFiles(files: File[]): boolean {
+  if (files.length === 0) return true;
+
+  const buildDataTransfer = () => {
+    const dt = new DataTransfer();
+    files.forEach((file) => dt.items.add(file));
+    return dt;
+  };
+
   // Strategy 1: programmatic file input
   const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
   for (const inp of fileInputs) {
+    if (inp.disabled) continue;
     try {
-      const dt = new DataTransfer();
-      dt.items.add(file);
+      const dt = buildDataTransfer();
       inp.files = dt.files;
       inp.dispatchEvent(new Event('change', { bubbles: true }));
       inp.dispatchEvent(new Event('input', { bubbles: true }));
@@ -200,8 +210,7 @@ function tryAttachFile(file: File): boolean {
     const el = document.querySelector(sel);
     if (!el) continue;
     try {
-      const dt = new DataTransfer();
-      dt.items.add(file);
+      const dt = buildDataTransfer();
       el.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
       el.dispatchEvent(new DragEvent('dragover',  { dataTransfer: dt, bubbles: true, cancelable: true }));
       el.dispatchEvent(new DragEvent('drop',      { dataTransfer: dt, bubbles: true, cancelable: true }));
@@ -209,6 +218,38 @@ function tryAttachFile(file: File): boolean {
     } catch { /* try next */ }
   }
   return false;
+}
+
+function blobRecordToFile(blob: AttachmentBlob): File {
+  const binary = atob(blob.dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes.buffer as ArrayBuffer], blob.name || `attachment-${blob.alias}`, {
+    type: blob.mimeType || 'application/octet-stream'
+  });
+}
+
+async function fetchCapturedAttachmentBlobs(): Promise<AttachmentBlob[]> {
+  const resp = await msgBg<{ blobs?: AttachmentBlob[] }>({ type: 'FETCH_ATTACHMENTS' });
+  return Array.isArray(resp?.blobs) ? resp.blobs : [];
+}
+
+async function attachCapturedFiles(): Promise<{ total: number; attached: number; failed: number }> {
+  const blobs = await fetchCapturedAttachmentBlobs();
+  const files = blobs.map(blobRecordToFile);
+  const attached = tryAttachFiles(files) ? files.length : 0;
+  if (attached > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  }
+  return { total: blobs.length, attached, failed: blobs.length - attached };
+}
+
+function formatPasteResult(base: string, result: { total: number; attached: number; failed: number }): string {
+  if (result.total === 0) return base;
+  if (result.failed === 0) {
+    return `${base} Attached ${result.attached} captured file${result.attached !== 1 ? 's' : ''}.`;
+  }
+  return `${base} Attached ${result.attached}/${result.total} captured file(s); click the target input/upload area and retry if any are missing.`;
 }
 
 /** Paste raw message text with no system-prompt framing. */
@@ -228,7 +269,7 @@ async function actionPasteRaw(): Promise<string> {
 
   const success = adapter.injectPrompt(raw);
   if (!success) throw new Error('Could not inject into the text box. Try clicking the input area first.');
-  return 'Raw transcript injected into the text box.';
+  return formatPasteResult('Raw transcript injected into the text box.', await attachCapturedFiles());
 }
 
 /** Build a file and try to attach it to the page; fall back to download. */
@@ -252,7 +293,9 @@ async function actionPasteAsFile(fmt: AttachFormat): Promise<string> {
 
   const file = new File([blob], filename, { type: blob.type });
   const attached = tryAttachFile(file);
-  if (attached) return `${fmt.toUpperCase()} file attached to the chat input.`;
+  if (attached) {
+    return formatPasteResult(`${fmt.toUpperCase()} file attached to the chat input.`, await attachCapturedFiles());
+  }
 
   // Fallback: trigger download so user can attach manually
   triggerDownload(blob, filename);
