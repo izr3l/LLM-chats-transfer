@@ -1,5 +1,6 @@
-import { AttachmentRef, CanonicalConversation, Message } from '../../schema/canonical';
+import { CanonicalConversation, Message } from '../../schema/canonical';
 import { SourceAdapter } from './index';
+import { extractMessageAttachments, hasAttachmentContent } from './attachmentExtraction';
 
 export class GenericFallbackAdapter implements SourceAdapter {
   private sourceName: string;
@@ -50,215 +51,12 @@ export class GenericFallbackAdapter implements SourceAdapter {
     return nodes;
   }
 
-  private normalizeUrl(rawUrl: string): string {
-    try {
-      return new URL(rawUrl, window.location.href).toString();
-    } catch {
-      return rawUrl;
-    }
-  }
-
-  private isLikelyFileLink(url: string): boolean {
-    return /(\.pdf|\.docx?|\.xlsx?|\.pptx?|\.txt|\.csv|\.json|\.zip|\.rar|\.7z|\.mp4|\.mp3|\.wav|\.mov|\.webm)(\?|#|$)/i.test(url);
-  }
-
   private isComposerNode(node: HTMLElement): boolean {
     return Boolean(
       node.closest(
         'form, textarea, [contenteditable="true"], [role="textbox"], #prompt-textarea, [data-testid*="composer"], [data-testid*="input"]'
       )
     );
-  }
-
-  private extractAttachments(node: HTMLElement, messageIndex: number): AttachmentRef[] {
-    const attachments: AttachmentRef[] = [];
-    const seen = new Set<string>();
-
-    const register = (attachment: AttachmentRef) => {
-      const key = `${attachment.kind}|${attachment.url || ''}|${attachment.name || ''}`;
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
-      attachments.push(attachment);
-    };
-
-    const imageNodes = Array.from(node.querySelectorAll('img[src]'));
-    imageNodes.forEach((img, index) => {
-      const src = img.getAttribute('src') || '';
-      if (!src) {
-        return;
-      }
-
-      register({
-        id: `m${messageIndex}-img-${index}`,
-        kind: 'image',
-        name: img.getAttribute('alt') || `Image ${index + 1}`,
-        url: this.normalizeUrl(src),
-        sourceHint: 'img'
-      });
-    });
-
-    const linkNodes = Array.from(node.querySelectorAll('a[href]'));
-    linkNodes.forEach((anchor, index) => {
-      const href = anchor.getAttribute('href') || '';
-      if (!href) {
-        return;
-      }
-
-      const normalizedHref = this.normalizeUrl(href);
-      const label = (anchor.textContent || '').trim();
-      const kind: AttachmentRef['kind'] = this.isLikelyFileLink(normalizedHref) ? 'file' : 'link';
-
-      register({
-        id: `m${messageIndex}-lnk-${index}`,
-        kind,
-        name: label || undefined,
-        url: normalizedHref,
-        sourceHint: 'anchor'
-      });
-    });
-
-    const chipNodes = Array.from(
-      node.querySelectorAll(
-        '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment"], [class*="file-chip"], [class*="upload"]'
-      )
-    );
-
-    chipNodes.forEach((chip, index) => {
-      const text = (chip.textContent || '').trim();
-      if (!text) {
-        return;
-      }
-
-      const chipUrl = this.extractUrlFromChip(chip as HTMLElement);
-      const fileContent = this.extractFileContentNearChip(chip as HTMLElement);
-
-      register({
-        id: `m${messageIndex}-chip-${index}`,
-        kind: 'file',
-        name: text,
-        url: chipUrl || undefined,
-        textContent: fileContent || undefined,
-        sourceHint: 'attachment-chip'
-      });
-    });
-
-    // Also look for download buttons / links
-    const downloadBtns = Array.from(node.querySelectorAll(
-      'a[download], button[data-download-url], [data-testid*="download"], a[href*="/file/"], a[href*="/download"]'
-    ));
-    downloadBtns.forEach((btn, index) => {
-      const href = btn.getAttribute('href') || btn.getAttribute('data-download-url') || '';
-      if (!href) return;
-      const label = (btn.textContent || '').trim() || `Download ${index + 1}`;
-      register({
-        id: `m${messageIndex}-dl-${index}`,
-        kind: 'file',
-        name: label,
-        url: this.normalizeUrl(href),
-        sourceHint: 'download-btn'
-      });
-    });
-
-    return attachments;
-  }
-
-  private extractUrlFromChip(chip: HTMLElement): string | null {
-    if (chip.tagName === 'A') {
-      const href = chip.getAttribute('href');
-      if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-        return this.normalizeUrl(href);
-      }
-    }
-
-    const dataUrl = chip.getAttribute('data-url') || chip.getAttribute('data-href') ||
-      chip.getAttribute('data-download-url') || chip.getAttribute('data-src') || '';
-    if (dataUrl) return this.normalizeUrl(dataUrl);
-
-    const innerAnchor = chip.querySelector('a[href]');
-    if (innerAnchor) {
-      const href = innerAnchor.getAttribute('href') || '';
-      if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-        return this.normalizeUrl(href);
-      }
-    }
-
-    const dlBtn = chip.querySelector('[download], [data-download-url]');
-    if (dlBtn) {
-      const href = dlBtn.getAttribute('href') || dlBtn.getAttribute('data-download-url') || '';
-      if (href) return this.normalizeUrl(href);
-    }
-
-    let parent = chip.parentElement;
-    for (let i = 0; i < 5 && parent; i++) {
-      if (parent.tagName === 'A') {
-        const href = parent.getAttribute('href') || '';
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-          return this.normalizeUrl(href);
-        }
-      }
-      parent = parent.parentElement;
-    }
-
-    return null;
-  }
-
-  private extractFileContentNearChip(chip: HTMLElement): string | null {
-    const MAX_CONTENT = 200_000;
-    const contentSelectors = [
-      '[class*="content"]', '[class*="preview"]', '[class*="expanded"]',
-      '[class*="file-content"]', '[class*="attachment-content"]',
-      'pre', 'code', '[class*="code-block"]', '[class*="highlight"]',
-      '[class*="text"]', '[class*="body"]',
-    ];
-
-    // Look within the chip's parent container (up to 3 levels)
-    let container = chip.parentElement;
-    for (let level = 0; level < 3 && container; level++) {
-      for (const sel of contentSelectors) {
-        const contentEl = container.querySelector(sel);
-        if (contentEl && contentEl !== chip && !chip.contains(contentEl)) {
-          const text = (contentEl as HTMLElement).innerText?.trim() || '';
-          if (text.length > 50) {
-            return text.slice(0, MAX_CONTENT);
-          }
-        }
-      }
-      container = container.parentElement;
-    }
-
-    // Check next sibling elements
-    let sibling = chip.nextElementSibling;
-    for (let i = 0; i < 5 && sibling; i++) {
-      const sibEl = sibling as HTMLElement;
-      if (sibEl.tagName === 'PRE' || sibEl.tagName === 'CODE' ||
-          sibEl.querySelector?.('pre, code, [class*="code-block"]')) {
-        const text = sibEl.innerText?.trim() || '';
-        if (text.length > 50) return text.slice(0, MAX_CONTENT);
-      }
-      if (sibEl.className && /content|preview|expanded|file-/i.test(sibEl.className)) {
-        const text = sibEl.innerText?.trim() || '';
-        if (text.length > 50) return text.slice(0, MAX_CONTENT);
-      }
-      sibling = sibling.nextElementSibling;
-    }
-
-    // Check if wrapper has more text than just the chip name
-    let wrapper = chip.parentElement;
-    for (let i = 0; i < 5 && wrapper; i++) {
-      if (wrapper.getAttribute('data-message-author') || wrapper.getAttribute('data-role') ||
-          /\bmessage\b/i.test(wrapper.className || '')) break;
-      const wrapperText = wrapper.innerText?.trim() || '';
-      const chipText = chip.textContent?.trim() || '';
-      if (wrapperText.length > chipText.length + 100) {
-        const remaining = wrapperText.replace(chipText, '').trim();
-        if (remaining.length > 50) return remaining.slice(0, MAX_CONTENT);
-      }
-      wrapper = wrapper.parentElement;
-    }
-
-    return null;
   }
 
   private inferRole(node: HTMLElement, index: number): 'user' | 'assistant' {
@@ -299,7 +97,7 @@ export class GenericFallbackAdapter implements SourceAdapter {
       messageNodes.forEach((node) => {
 
         const text = (node.innerText || node.textContent || '');
-        if (!text.trim()) {
+        if (!text.trim() && !hasAttachmentContent(node)) {
           return;
         }
 
@@ -336,7 +134,7 @@ export class GenericFallbackAdapter implements SourceAdapter {
 
     uniqueNodes.forEach((node, index) => {
       const text = node.innerText || '';
-      const attachments = this.extractAttachments(node, index);
+      const attachments = extractMessageAttachments(node, index);
       attachmentCount += attachments.length;
       messages.push({
         id: `msg-${index}`,

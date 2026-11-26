@@ -6,7 +6,7 @@ LLM Chat Transfer is a powerful browser extension that enables you to extract yo
 
 - **Cross-Platform Transfer:** Extract and inject conversations across multiple top-tier AI targets.
 - **Fidelity Preservation:** It captures conversation text, markdown, code blocks, timestamps, and roles using a normalized canonical schema.
-- **Attachment Capture:** Automatically downloads actual file attachments (images, PDFs, documents, etc.) from chat conversations and stores them in IndexedDB. Attachments are linked to numeric aliases in the transcript and reattached as real files when pasting into the target.
+- **Attachment Transfer:** Captures accessible original files (images, PDFs, documents, etc.) into IndexedDB and adds them to the destination composer alongside the transcript. Files unavailable from the source or unsupported by the destination are reported by name.
 - **AI Chat Summarization:** Automatically summarizes your copied chat using Groq's high-performance LLM APIs, providing quick context overviews before you switch providers.
 - **Multiple Paste Modes:** Choose how to inject your captured chat — paste inline (with system framing), paste raw (plain text), or attach as a PDF, TXT, or DOC file.
 - **Download Formats:** Export any captured chat as TXT, Markdown, Word (.doc), or PDF — all generated client-side with zero external dependencies.
@@ -77,16 +77,27 @@ To build and run this extension locally you need:
    - **Paste Inline** — Injects the full conversation with system framing
    - **Paste Raw** — Injects plain message text without framing
    - **Attach as PDF / TXT / DOC** — Generates a file and attaches it to the chat input
-5. **File Attachments**: Captured file attachments are listed by name in the pasted transcript. You must re-upload them manually to the target chat — automatic reattachment is not supported.
+5. **File Attachments**: Accessible original files are saved with the capture and added to the destination composer in every paste mode. If a file appears under **Missing files**, select **Add file** and choose your local copy. The file is saved with that chat in History and included on future pastes. Review the destination's file chips and wait for uploads to finish before pressing Send.
 6. **Manage History**: Review old captured conversations in the history drawer. Load, download, or delete previous captures.
 
 ### How Attachment Capture Works
 
 When you capture a chat, the extension:
-1. Extracts attachment references from the DOM (images, file chips, download links)
-2. Downloads each file via the page context (with session cookies) or falls back to background fetch
-3. Stores binary data as base64 in IndexedDB, linked to the transfer by numeric aliases
-4. Lists attachment names in the transcript so you can identify which files to re-upload manually
+1. Extracts attachment references from the loaded conversation (images, file chips, download links). Hidden attachment URLs are matched conservatively by exact filename; unrelated assets are excluded.
+2. Downloads available original bytes through the authenticated source page, with a background download fallback. Inline image data and same-origin blob URLs are supported.
+3. Saves the transcript and validated file data together, linked by a stable transfer ID that also survives loading from history.
+4. Adds the saved originals through the destination file input or a handled drop event. When the transcript itself is a PDF, TXT, or DOC, it and the originals are added in one batch.
+5. Reports files that could not be captured or added. A filename or rendered preview alone is insufficient to recover an original PDF, image, or document; the extension never substitutes preview text for the original binary.
+
+Provider interfaces, permissions, file type restrictions, and upload limits still apply. A successful file handoff means the files were supplied to the composer; check the destination's upload state before sending. Conversations captured by older versions may need recapturing to recover missing file links. Transcript exports contain attachment references, with original files stored separately.
+
+For **Claude → ChatGPT**, capture the Claude chat and then use Paste in ChatGPT. Claude files that expose a downloadable original can transfer automatically. If Claude only shows a preview, open the saved capture and select **Add file** beside the filename if you have the original on your computer.
+
+### Verify a transfer
+
+Build with `npm run build`, reload the unpacked extension, and refresh both provider tabs. Capture a conversation containing an image and PDF, check the saved file count, then paste into the destination and review the filenames and upload state. Try both inline paste and a transcript-as-file mode. Finally load the capture from History and repeat the paste to confirm its original files remain available.
+
+Development checks: `npm test`, `npm run typecheck`, and `npm run build`.
 
 ## Security Notes
 

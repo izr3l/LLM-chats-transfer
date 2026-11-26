@@ -371,6 +371,13 @@
       color: #56d364;
     }
 
+    .missing-attachments { margin-bottom: 16px; padding: 10px; border: 1px solid var(--border); border-radius: 6px; }
+    .missing-attachments h3 { font-size: 13px; margin: 0 0 6px; }
+    .missing-attachment-list { max-height: 150px; overflow: auto; }
+    .missing-attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; }
+    .missing-attachment-row span { min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+    .missing-attachment-row button { flex-shrink: 0; font-size: 12px; padding: 5px 8px; }
+
     /* ===== BUTTONS ===== */
     .actions {
       display: flex;
@@ -896,7 +903,11 @@
       </button>
     </div>
 
-    <div id="status" class="status-box status">Ready. Open a supported chat tab to begin.</div>
+    <div id="status" class="status-box status" role="status">Ready. Open a supported chat tab to begin.</div>
+
+    <section class="missing-attachments" id="missingAttachments" aria-labelledby="missingAttachmentsHeading" hidden>
+      <h3 id="missingAttachmentsHeading">Missing files</h3>
+    </section>
 
     <div id="pageDetect" class="page-detect" style="display:none;"></div>
 

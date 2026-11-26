@@ -1,92 +1,53 @@
-// Content script: Target injection
-
+// Target injection shared by the popup listener and in-page toolbar.
 import { TargetAdapter } from '../adapters/targets';
 import { ChatGPTAdapter } from '../adapters/targets/chatgpt';
 import { GenericTargetAdapter } from '../adapters/targets/fallback';
 import { ManusTargetAdapter } from '../adapters/targets/manus';
-import { CanonicalConversation } from '../schema/canonical';
+import { AttachmentBlob, CanonicalConversation, isValidCanonicalConversation } from '../schema/canonical';
+import { AttachmentResult, attachFilesToPage, fileFromBase64 } from '../shared/attachmentUpload';
+import { formatAttachmentReferences } from '../shared/attachmentReferences';
 
 declare global {
-  interface Window {
-    __chatTransferTargetRegistered?: boolean;
-  }
+  interface Window { __chatTransferTargetRegistered?: boolean; }
 }
 
-
-function bytesToHex(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+export interface InjectionRequest {
+  type: 'INJECT' | 'INJECT_RAW' | 'INJECT_FILE';
+  base64?: string;
+  filename?: string;
+  mimeType?: string;
+  /** Bind a pre-built transcript file to the snapshot it was generated from. */
+  transferId?: string;
 }
 
-async function computeSha256(payload: string): Promise<string> {
-  const encoded = new TextEncoder().encode(payload);
-  const digest = await crypto.subtle.digest('SHA-256', encoded);
-  return bytesToHex(digest);
+export interface InjectionResponse {
+  status: 'success' | 'partial' | 'error';
+  error?: string;
+  attachmentResult?: AttachmentResult;
+  warnings?: string[];
+}
+
+function sendBackground<T>(request: Record<string, unknown>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(request, (response) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else if (response?.status === 'error') reject(new Error(response.error || 'Extension request failed.'));
+      else resolve(response as T);
+    });
+  });
 }
 
 async function verifyIntegrity(transcript: CanonicalConversation): Promise<boolean> {
-  if (!transcript.integrity?.sha256) {
-    console.warn('ChatTransfer: No integrity hash present. Skipping verification.');
-    return true;
-  }
-
-  const canonicalPayload = JSON.stringify({
-    metadata: transcript.metadata,
-    messages: transcript.messages
-  });
-  const computed = await computeSha256(canonicalPayload);
-  return computed === transcript.integrity.sha256;
+  if (!transcript.integrity?.sha256) return true;
+  const canonical = JSON.stringify({ metadata: transcript.metadata, messages: transcript.messages });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return hash === transcript.integrity.sha256;
 }
 
-
-
-/**
- * Try to attach a File to the page via file input or drag-drop.
- */
-function tryAttachFileToPage(file: File): boolean {
-  // Strategy 1: file input
-  const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
-  for (const inp of fileInputs) {
-    try {
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      inp.files = dt.files;
-      inp.dispatchEvent(new Event('change', { bubbles: true }));
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
-    } catch { /* try next */ }
-  }
-
-  // Strategy 2: drag-drop
-  const dropSelectors = [
-    '.ProseMirror', '[data-lexical-editor]', '[role="textbox"]',
-    'textarea', 'div[contenteditable]', '[data-testid*="composer"]',
-    '[data-testid*="input"]', 'form', 'main',
-  ];
-  for (const sel of dropSelectors) {
-    const el = document.querySelector(sel);
-    if (!el) continue;
-    try {
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      el.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
-      el.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true }));
-      el.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
-      return true;
-    } catch { /* try next */ }
-  }
-
-  return false;
-}
-
-/**
- * Strip [attachment:N "name"] placeholders from transcript text, returning clean text.
- */
 function stripAttachmentPlaceholders(text: string): string {
   return text.replace(/\n*\[attachment:\d+\s+"[^"]*"\]/g, '').trimEnd();
 }
-
-
 
 function getAdapter(): TargetAdapter {
   const host = window.location.hostname;
@@ -136,141 +97,120 @@ function getAdapter(): TargetAdapter {
   throw new Error(`Unsupported target: ${host}`);
 }
 
-// Guard: prevent double-registration when script is injected multiple times
+interface OriginalFile { alias: number; file: File; }
+
+async function loadOriginalFiles(transcript: CanonicalConversation, transferId?: string): Promise<{
+  files: OriginalFile[]; missing: string[]; warnings: string[];
+}> {
+  const references = transcript.messages.flatMap((message) => message.attachments || [])
+    .filter((attachment) => attachment.kind !== 'link');
+  const files: OriginalFile[] = [];
+  const missing = new Set<string>();
+  const warnings: string[] = [];
+  const aliases = new Set<number>();
+  for (const reference of references) {
+    const name = reference.name || 'unnamed file';
+    if (reference.blobAlias === undefined || !transferId) { missing.add(name); continue; }
+    if (aliases.has(reference.blobAlias)) continue;
+    aliases.add(reference.blobAlias);
+    try {
+      // Chrome messages have a size cap: load each <=25 MB file separately.
+      const response = await sendBackground<{ blob?: AttachmentBlob | null }>({
+        type: 'FETCH_ATTACHMENT', transferId, alias: reference.blobAlias,
+      });
+      const blob = response.blob;
+      if (!blob || blob.alias !== reference.blobAlias || blob.transferId !== transferId) {
+        missing.add(name);
+        continue;
+      }
+      const file = fileFromBase64(blob.dataBase64, blob.name, blob.mimeType);
+      if (file.size !== blob.size) throw new Error('Captured file size does not match stored data.');
+      files.push({ alias: blob.alias, file });
+    } catch (error) {
+      missing.add(name);
+      warnings.push(error instanceof Error ? error.message : `Could not load ${name}.`);
+    }
+  }
+  return { files, missing: [...missing], warnings };
+}
+
+function rawTranscript(transcript: CanonicalConversation): string {
+  return transcript.messages.map((message) => {
+    const role = message.role === 'user' ? 'User' : 'Assistant';
+    const text = message.content.map((content) => content.text).join('\n').trim();
+    return `${role}:\n${text}\n${formatAttachmentReferences(message)}`;
+  }).join('\n\n');
+}
+
+/** Stage the complete attachment batch once, and keep the saved transfer for retries. */
+export async function injectTransfer(request: InjectionRequest): Promise<InjectionResponse> {
+  try {
+    const adapter = getAdapter();
+    const snapshot = await sendBackground<{ payload?: unknown; transferId?: string }>({ type: 'FETCH_TRANSCRIPT' });
+    if (!isValidCanonicalConversation(snapshot.payload)) {
+      throw new Error('No valid captured chat found. Capture a chat first.');
+    }
+    const transcript = snapshot.payload;
+    if (request.transferId && request.transferId !== snapshot.transferId) {
+      throw new Error('The selected capture changed. Choose Paste again to use the current capture.');
+    }
+    if (!await verifyIntegrity(transcript)) {
+      throw new Error('Integrity check failed. Transfer aborted. Capture the chat again.');
+    }
+    const originals = await loadOriginalFiles(transcript, snapshot.transferId);
+    let transcriptFile: File | undefined;
+    if (request.type === 'INJECT_FILE') {
+      transcriptFile = fileFromBase64(request.base64!, request.filename!, request.mimeType!);
+    } else if (request.type === 'INJECT' && adapter.createTranscriptFile) {
+      transcriptFile = adapter.createTranscriptFile(transcript);
+    }
+    const files = [...(transcriptFile ? [transcriptFile] : []), ...originals.files.map((entry) => entry.file)];
+    const uploaded = attachFilesToPage(files);
+    const attachedOriginals = originals.files.filter((entry) => uploaded.attached.includes(entry.file));
+    const attachmentResult: AttachmentResult = {
+      attempted: originals.files.length,
+      attached: attachedOriginals.length,
+      missing: originals.missing,
+      failed: originals.files.filter((entry) => !uploaded.attached.includes(entry.file)).map((entry) => entry.file.name),
+      method: uploaded.method,
+    };
+    const warnings = [...originals.warnings];
+    if (uploaded.attached.length) warnings.push('Review the files in the composer and wait for uploads to finish before sending.');
+    if (originals.missing.length) warnings.push('Some original files were unavailable during capture. Add them manually if needed.');
+    if (attachmentResult.failed.length) warnings.push('The target did not accept the file batch. Use its upload button to add the files manually.');
+
+    if (transcriptFile && !uploaded.attached.includes(transcriptFile)) {
+      return { status: 'error', error: 'The transcript file could not be added to this composer.', attachmentResult, warnings };
+    }
+    if (request.type !== 'INJECT_FILE') {
+      let prompt = request.type === 'INJECT_RAW' ? rawTranscript(transcript)
+        : transcriptFile ? (adapter.filePrompt?.(transcript) || 'Read the attached transcript and continue from its last message.')
+        : adapter.generateSingleShotPrompt(transcript);
+      if (attachmentResult.failed.length || attachmentResult.missing.length) {
+        prompt += `\n\nFiles still needed in this chat: ${[...attachmentResult.missing, ...attachmentResult.failed].join(', ')}. Ask the user to upload any of these needed to answer.`;
+      }
+      if (!adapter.injectPrompt(stripAttachmentPlaceholders(prompt))) {
+        const staged = uploaded.attached.length
+          ? ` ${uploaded.attached.length} file(s) were already added to the composer. Review them before retrying to avoid duplicates.`
+          : '';
+        return { status: 'error', error: `Could not find a text input on this page.${staged}`, attachmentResult, warnings };
+      }
+    }
+    return {
+      status: attachmentResult.failed.length || attachmentResult.missing.length || originals.warnings.length ? 'partial' : 'success',
+      attachmentResult, warnings,
+    };
+  } catch (error) {
+    return { status: 'error', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// The same guard is used when this module is bundled in the toolbar and injected by the popup.
 if (!window.__chatTransferTargetRegistered) {
   window.__chatTransferTargetRegistered = true;
-
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-    if (request.type === 'INJECT') {
-      (async () => {
-        try {
-          const adapter = getAdapter();
-
-          // Request pending transcript from Service Worker storage
-          chrome.runtime.sendMessage({ type: 'FETCH_TRANSCRIPT' }, async (response) => {
-            const transcript = response?.payload as CanonicalConversation | null;
-
-            if (!transcript) {
-              sendResponse({ status: 'error', error: 'No pending transcript found.' });
-              return;
-            }
-
-            const integrityValid = await verifyIntegrity(transcript);
-            if (!integrityValid) {
-              sendResponse({
-                status: 'error',
-                error: 'Integrity check failed. The transcript may have been tampered with. Transfer aborted.'
-              });
-              return;
-            }
-
-            // Inject the prompt (file-upload adapters like Manus use injectViaFile)
-            let success: boolean;
-
-            if (typeof adapter.injectViaFile === 'function') {
-              success = await adapter.injectViaFile(transcript);
-            } else {
-              const prompt = stripAttachmentPlaceholders(
-                adapter.generateSingleShotPrompt(transcript)
-              );
-              success = adapter.injectPrompt(prompt);
-            }
-
-            if (success) {
-              chrome.storage.local.remove(['pendingTransfer', 'pendingTransferEncrypted', 'activeTransferId']);
-              sendResponse({ status: 'success' });
-            } else {
-              sendResponse({ status: 'error', error: 'Injection failed. Target DOM issue.' });
-            }
-          });
-        } catch (e: unknown) {
-          const message = e instanceof Error ? e.message : String(e);
-          sendResponse({ status: 'error', error: message });
-        }
-      })();
-
-      return true; // Indicates async response.
-    }
-
-    // ── Paste raw: inject plain message text with structured framing ────────────
-    if (request.type === 'INJECT_RAW') {
-      (async () => {
-        try {
-          const adapter = getAdapter();
-          chrome.runtime.sendMessage({ type: 'FETCH_TRANSCRIPT' }, async (response) => {
-            try {
-              if (chrome.runtime.lastError) {
-                sendResponse({ status: 'error', error: chrome.runtime.lastError.message });
-                return;
-              }
-
-              const transcript = response?.payload as CanonicalConversation | null;
-              if (!transcript) {
-                sendResponse({ status: 'error', error: 'No pending transcript found.' });
-                return;
-              }
-              const { source, title, createdAt } = transcript.metadata;
-              const count = transcript.integrity?.messageCount ?? transcript.messages.length;
-
-              let raw = `Chat Transcript — ${title ?? 'Untitled'}\n`;
-              raw += `Source: ${source}  |  Messages: ${count}  |  Captured: ${new Date(createdAt).toLocaleString()}\n\n`;
-              raw += `--- TRANSCRIPT START ---\n\n`;
-
-              transcript.messages.forEach((m) => {
-                const role = m.role === 'user' ? 'User' : 'Assistant';
-                const text = m.content.map((c: { text?: string }) => c.text ?? '').join('\n').trim();
-                raw += `${role}:\n${text}\n`;
-                if (m.attachments && m.attachments.length > 0) {
-                  raw += `Attachments (not auto-uploaded — user must re-upload manually):\n`;
-                  m.attachments.forEach((att) => {
-                    raw += `  - [${att.kind}] ${att.name || 'unnamed file'}\n`;
-                  });
-                }
-                raw += '\n';
-              });
-
-              raw += `--- TRANSCRIPT END ---\n`;
-              raw = stripAttachmentPlaceholders(raw);
-
-              const success = adapter.injectPrompt(raw);
-              if (success) {
-                sendResponse({ status: 'success' });
-              } else {
-                sendResponse({ status: 'error', error: 'Could not find a text input on this page.' });
-              }
-            } catch (e: unknown) {
-              sendResponse({ status: 'error', error: e instanceof Error ? e.message : String(e) });
-            }
-          });
-        } catch (e: unknown) {
-          sendResponse({ status: 'error', error: e instanceof Error ? e.message : String(e) });
-        }
-      })();
-      return true;
-    }
-
-    // ── Inject file: attach a pre-built file via DataTransfer / drag-drop ──────
-    if (request.type === 'INJECT_FILE') {
-      (async () => {
-        try {
-          const { base64, filename, mimeType } = request as { base64: string; filename: string; mimeType: string };
-
-          // Decode base64 → File
-          const binary = atob(base64);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          const file = new File([bytes.buffer as ArrayBuffer], filename, { type: mimeType });
-
-          if (tryAttachFileToPage(file)) {
-            sendResponse({ status: 'success' });
-          } else {
-            sendResponse({ status: 'error', error: 'No file drop zone found on this page.' });
-          }
-        } catch (e: unknown) {
-          sendResponse({ status: 'error', error: e instanceof Error ? e.message : String(e) });
-        }
-      })();
-      return true;
-    }
+    if (!['INJECT', 'INJECT_RAW', 'INJECT_FILE'].includes(request.type)) return;
+    void injectTransfer(request as InjectionRequest).then(sendResponse);
+    return true;
   });
 }

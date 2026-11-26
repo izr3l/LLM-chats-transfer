@@ -105,6 +105,7 @@ export function harvestAttachmentUrls(): HarvestedAttachment[] {
 
     // Check for URL-like string properties
     for (const key of Object.keys(record)) {
+      if (/^(?:_owner|owner|return|stateNode|alternate|_debugOwner|store|cache|queryClient|context)$/i.test(key)) continue;
       const val = record[key];
       if (typeof val === 'string' && val.startsWith('https://') && isAttachmentUrl(val)) {
         if (!results.has(val)) {
@@ -143,9 +144,15 @@ export function harvestAttachmentUrls(): HarvestedAttachment[] {
       }
     }
 
-    // Walk child, sibling, return fibers
-    walkFiber(fiber['child'] as Record<string, unknown> | null, visited);
-    walkFiber(fiber['sibling'] as Record<string, unknown> | null, visited);
+    // Visit descendants only. A message root's sibling/owner can belong to a
+    // different message or cached conversation.
+    let child = fiber['child'] as Record<string, unknown> | null;
+    const siblings = new Set<unknown>();
+    while (child && !siblings.has(child) && fiberCount <= MAX_FIBERS) {
+      siblings.add(child);
+      walkFiber(child, visited);
+      child = child['sibling'] as Record<string, unknown> | null;
+    }
   }
 
   // Start from conversation turn elements (ChatGPT specific)
@@ -160,10 +167,6 @@ export function harvestAttachmentUrls(): HarvestedAttachment[] {
   for (const sel of turnSelectors) {
     document.querySelectorAll(sel).forEach((el) => elements.add(el));
   }
-
-  // Also try root React container
-  const rootEl = document.getElementById('__next') || document.getElementById('root') || document.body;
-  if (rootEl) elements.add(rootEl);
 
   for (const el of elements) {
     const fiberKey = findFiberKey(el);
@@ -180,15 +183,6 @@ export function harvestAttachmentUrls(): HarvestedAttachment[] {
       }
     }
   }
-
-  // Also scan __NEXT_DATA__ (NextJS SSR data)
-  try {
-    const nextDataScript = document.getElementById('__NEXT_DATA__');
-    if (nextDataScript?.textContent) {
-      const data = JSON.parse(nextDataScript.textContent);
-      scanObject(data, 0, new Set());
-    }
-  } catch { /* ignore */ }
 
   return Array.from(results.values());
 }

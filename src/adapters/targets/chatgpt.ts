@@ -1,18 +1,10 @@
 import { CanonicalConversation } from '../../schema/canonical';
 import { TargetAdapter } from './index';
+import { formatAttachmentReferences } from '../../shared/attachmentReferences';
 
 export class ChatGPTAdapter implements TargetAdapter {
   private formatAttachments(msg: CanonicalConversation['messages'][number]): string {
-    if (!msg.attachments || msg.attachments.length === 0) {
-      return '';
-    }
-
-    const lines = msg.attachments.map((attachment) => {
-      const label = attachment.name || 'unnamed file';
-      return `- [${attachment.kind}] ${label}`;
-    });
-
-    return `Attachments (not auto-uploaded — user must re-upload manually):\n${lines.join('\n')}\n`;
+    return formatAttachmentReferences(msg);
   }
 
   /**
@@ -38,7 +30,9 @@ export class ChatGPTAdapter implements TargetAdapter {
     });
 
     promptText += `--- TRANSCRIPT END ---\n\n`;
-    promptText += `IMPORTANT: Some messages in this transcript had file attachments. These files could NOT be automatically uploaded to this chat. The attachment names are listed under each message. If the user needs the LLM to reference those files, they must manually upload them here.\n\n`;
+    if (conversation.messages.some((message) => message.attachments?.some((attachment) => attachment.kind !== 'link'))) {
+      promptText += `Use source attachments only when their corresponding files are available in this chat. Ask the user for any missing files needed to answer.\n\n`;
+    }
     promptText += `Now continue with the best possible answer specifically addressing the last user message.`;
 
     return promptText;

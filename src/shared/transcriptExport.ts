@@ -34,7 +34,7 @@ export function buildPlainText(t: TranscriptLike): string {
     const text = msg.content.map((c) => c.text).join('\n').trim();
     out += `[${role}]\n${text}\n`;
     if (msg.attachments && msg.attachments.length > 0) {
-      out += `Attachments (not auto-uploaded — user must re-upload manually):\n`;
+      out += `Attachment references (original files are stored separately):\n`;
       msg.attachments.forEach((att) => {
         out += `  - [${att.kind}] ${att.name || 'unnamed file'}\n`;
       });
@@ -56,7 +56,7 @@ export function buildMarkdown(t: TranscriptLike): string {
     const text = msg.content.map((c) => c.text).join('\n').trim();
     md += `${role}\n\n${text}\n`;
     if (msg.attachments && msg.attachments.length > 0) {
-      md += `\n**Attachments** *(not auto-uploaded — user must re-upload manually):*\n`;
+      md += `\n**Attachment references** *(original files are stored separately):*\n`;
       msg.attachments.forEach((att) => {
         md += `- \`[${att.kind}]\` ${att.name || 'unnamed file'}\n`;
       });
@@ -95,7 +95,7 @@ export function buildDocBlob(t: TranscriptLike): Blob {
       body += `<w:p><w:r><w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r></w:p>`;
     });
     if (msg.attachments && msg.attachments.length > 0) {
-      body += `<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Attachments (not auto-uploaded — user must re-upload manually):</w:t></w:r></w:p>`;
+      body += `<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Attachment references (original files are stored separately):</w:t></w:r></w:p>`;
       msg.attachments.forEach((att) => {
         body += `<w:p><w:r><w:t xml:space="preserve">  - [${escapeXml(att.kind)}] ${escapeXml(att.name || 'unnamed file')}</w:t></w:r></w:p>`;
       });
@@ -125,7 +125,7 @@ export function buildPdfBytes(t: TranscriptLike): Uint8Array {
       for (let i = 0; i < raw.length; i += 90) lines.push(raw.slice(i, i + 90));
     });
     if (msg.attachments && msg.attachments.length > 0) {
-      lines.push('Attachments (not auto-uploaded):');
+      lines.push('Attachment references (original files are stored separately):');
       msg.attachments.forEach((att) => {
         lines.push(`  - [${att.kind}] ${att.name || 'unnamed file'}`);
       });

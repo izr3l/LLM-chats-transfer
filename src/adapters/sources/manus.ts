@@ -1,5 +1,6 @@
-import { AttachmentRef, CanonicalConversation, Message } from '../../schema/canonical';
+import { CanonicalConversation, Message } from '../../schema/canonical';
 import { SourceAdapter } from './index';
+import { extractMessageAttachments, hasAttachmentContent } from './attachmentExtraction';
 
 type CandidateMessage = {
   role: 'user' | 'assistant';
@@ -50,18 +51,6 @@ export class ManusAdapter implements SourceAdapter {
     });
 
     return nodes;
-  }
-
-  private normalizeUrl(rawUrl: string): string {
-    try {
-      return new URL(rawUrl, window.location.href).toString();
-    } catch {
-      return rawUrl;
-    }
-  }
-
-  private isLikelyFileLink(url: string): boolean {
-    return /(\.pdf|\.docx?|\.xlsx?|\.pptx?|\.txt|\.csv|\.json|\.zip|\.rar|\.7z|\.mp4|\.mp3|\.wav|\.mov|\.webm)(\?|#|$)/i.test(url);
   }
 
   private normalizeText(text: string): string {
@@ -161,58 +150,6 @@ export class ManusAdapter implements SourceAdapter {
     return Boolean(eventNode.querySelector('.items-end'));
   }
 
-  private extractAttachments(node: HTMLElement, messageIndex: number): AttachmentRef[] {
-    const attachments: AttachmentRef[] = [];
-    const seen = new Set<string>();
-
-    const register = (attachment: AttachmentRef) => {
-      const key = `${attachment.kind}|${attachment.url || ''}|${attachment.name || ''}`;
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
-      attachments.push(attachment);
-    };
-
-    const imageNodes = Array.from(node.querySelectorAll('img[src]'));
-    imageNodes.forEach((img, index) => {
-      const src = img.getAttribute('src') || '';
-      if (!src) {
-        return;
-      }
-
-      register({
-        id: `m${messageIndex}-img-${index}`,
-        kind: 'image',
-        name: img.getAttribute('alt') || `Image ${index + 1}`,
-        url: this.normalizeUrl(src),
-        sourceHint: 'img'
-      });
-    });
-
-    const linkNodes = Array.from(node.querySelectorAll('a[href]'));
-    linkNodes.forEach((anchor, index) => {
-      const href = anchor.getAttribute('href') || '';
-      if (!href) {
-        return;
-      }
-
-      const normalizedHref = this.normalizeUrl(href);
-      const label = this.normalizeText(anchor.textContent || '');
-      const kind: AttachmentRef['kind'] = this.isLikelyFileLink(normalizedHref) ? 'file' : 'link';
-
-      register({
-        id: `m${messageIndex}-lnk-${index}`,
-        kind,
-        name: label || undefined,
-        url: normalizedHref,
-        sourceHint: 'anchor'
-      });
-    });
-
-    return attachments;
-  }
-
   private collectCandidates(): CandidateMessage[] {
     const candidates: CandidateMessage[] = [];
 
@@ -239,13 +176,13 @@ export class ManusAdapter implements SourceAdapter {
           const assistantText = this.normalizeText(
             markdownBlocks.map((block) => this.extractTextFromMarkdownNode(block)).filter(Boolean).join('\n\n')
           );
-          if (assistantText) candidates.push({ role: 'assistant', text: assistantText, node: eventNode });
+          if (assistantText || hasAttachmentContent(eventNode)) candidates.push({ role: 'assistant', text: assistantText, node: eventNode });
           return;
         }
 
         if (this.isUserEvent(eventNode)) {
           const userText = this.extractLikelyUserText(eventNode);
-          if (userText) candidates.push({ role: 'user', text: userText, node: eventNode });
+          if (userText || hasAttachmentContent(eventNode)) candidates.push({ role: 'user', text: userText, node: eventNode });
         }
       });
       
@@ -260,7 +197,7 @@ export class ManusAdapter implements SourceAdapter {
 
       const isAssistant = node.classList.contains('manus-markdown') || node.classList.contains('prose');
       const rawText = this.normalizeText(node.innerText || node.textContent || '');
-      if (!rawText || this.isUiNoiseLine(rawText)) return;
+      if ((!rawText || this.isUiNoiseLine(rawText)) && !hasAttachmentContent(node)) return;
 
       candidates.push({
         role: isAssistant ? 'assistant' : 'user',
@@ -286,7 +223,7 @@ export class ManusAdapter implements SourceAdapter {
         continue;
       }
 
-      const attachments = this.extractAttachments(candidate.node, i);
+      const attachments = extractMessageAttachments(candidate.node, i);
       attachmentCount += attachments.length;
 
       messages.push({
