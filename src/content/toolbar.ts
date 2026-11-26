@@ -2,16 +2,14 @@
 // Auto-injected on all supported provider pages.
 // Uses Shadow DOM for complete CSS isolation from the host page.
 
-import { ClaudeAdapter } from '../adapters/sources/claude';
-import { GenericFallbackAdapter } from '../adapters/sources/fallback';
-import { ManusAdapter } from '../adapters/sources/manus';
-import { ChatGPTAdapter } from '../adapters/targets/chatgpt';
-import { GenericTargetAdapter } from '../adapters/targets/fallback';
-import { ManusTargetAdapter } from '../adapters/targets/manus';
-import { AttachmentBlob, CanonicalConversation } from '../schema/canonical';
+import { CanonicalConversation } from '../schema/canonical';
+import { injectTransfer } from './target';
+import { formatInjectionFeedback, InjectionResponse } from '../shared/attachmentFeedback';
+import { mountMissingAttachmentPicker } from '../shared/missingAttachmentPicker';
 import {
   AttachFormat,
   DownloadFormat,
+  blobToBase64,
   buildDocBlob,
   buildMarkdown,
   buildPdfBytes,
@@ -26,18 +24,6 @@ declare global {
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
-function bytesToHex(buffer: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-async function computeSha256(payload: string): Promise<string> {
-  const encoded = new TextEncoder().encode(payload);
-  const digest = await crypto.subtle.digest('SHA-256', encoded);
-  return bytesToHex(digest);
-}
 
 function msgBg<T = Record<string, unknown>>(msg: Record<string, unknown>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -64,78 +50,17 @@ function msgBg<T = Record<string, unknown>>(msg: Record<string, unknown>): Promi
   });
 }
 
-// ─── Adapter selection (mirrors source.ts / target.ts) ────────────────────────
-
-function getSourceAdapter() {
-  const host = window.location.hostname;
-  if (host.includes('claude.ai')) return new ClaudeAdapter();
-  if (host.includes('chatgpt.com'))
-    return new GenericFallbackAdapter('ChatGPT', [
-      'article[data-testid^="conversation-turn-"]',
-      '[data-message-author-role]'
-    ]);
-  if (host.includes('gemini.google.com'))
-    return new GenericFallbackAdapter('Gemini', [
-      '[data-test-id="response-content"]',
-      'message-content',
-      'user-query',
-      '.model-response-text'
-    ]);
-  if (host.includes('manus.im') || host.includes('manus.com') || host.includes('manus.ai') || host.includes('manus.computer'))
-    return new ManusAdapter();
-  if (host.includes('qwen.ai') || host.includes('qwenlm.ai') || host.includes('chat.qwen.ai'))
-    return new GenericFallbackAdapter('Qwen', [
-      '[data-role="assistant"]', '[data-role="user"]',
-      '[data-testid*="message"]', '[class*="message"]', '[class*="chat-item"]',
-      'main article', 'main .prose'
-    ]);
-  if (host.includes('perplexity.ai'))
-    return new GenericFallbackAdapter('Perplexity', [
-      '[data-testid*="answer"]', '[data-testid*="query"]', 'main .prose', 'article'
-    ]);
-  if (host.includes('x.com'))
-    return new GenericFallbackAdapter('Grok', [
-      '[data-testid="messageEntry"]', '[data-testid="tweetText"]', 'article'
-    ]);
-  return null;
-}
-
-function getTargetAdapter(): import('../adapters/targets').TargetAdapter | null {
-  const host = window.location.hostname;
-  if (host.includes('chatgpt.com')) return new ChatGPTAdapter();
-  if (host.includes('claude.ai'))
-    return new GenericTargetAdapter('Claude', [
-      'div[contenteditable="true"]', 'div[role="textbox"]', 'textarea'
-    ]);
-  if (host.includes('gemini.google.com'))
-    return new GenericTargetAdapter('Gemini', [
-      'textarea', 'div[contenteditable="true"]', 'div[role="textbox"]'
-    ]);
-  if (host.includes('manus.im') || host.includes('manus.com') || host.includes('manus.ai') || host.includes('manus.computer'))
-    return new ManusTargetAdapter();
-  if (host.includes('qwen.ai') || host.includes('qwenlm.ai') || host.includes('chat.qwen.ai'))
-    return new GenericTargetAdapter('Qwen', [
-      'textarea', 'div[contenteditable="true"]', 'div[role="textbox"]'
-    ]);
-  if (host.includes('perplexity.ai'))
-    return new GenericTargetAdapter('Perplexity', [
-      'textarea', 'div[contenteditable="true"]', 'div[role="textbox"]'
-    ]);
-  if (host.includes('x.com'))
-    return new GenericTargetAdapter('Grok', [
-      'textarea[data-testid="tweetTextarea_0"]', 'div[contenteditable="true"]', 'div[role="textbox"]'
-    ]);
-  return null;
-}
-
 // ─── Actions ──────────────────────────────────────────────────────────────────
 
-async function actionExtract(): Promise<string> {
+type ActionFeedback = { message: string; partial: boolean };
+
+async function actionExtract(): Promise<ActionFeedback> {
   const result = await msgBg<{
     status: string;
     error?: string;
     data?: CanonicalConversation;
     capturedAttachments?: number;
+    unavailableAttachments?: number;
   }>({ type: 'CAPTURE_ACTIVE_TAB' });
 
   if (result.status !== 'success') throw new Error(result.error ?? 'Failed to store transcript.');
@@ -143,138 +68,42 @@ async function actionExtract(): Promise<string> {
   const count = conversation?.integrity?.messageCount ?? conversation?.messages.length ?? 0;
   const source = conversation?.metadata.source ?? 'this page';
   const captured = result.capturedAttachments ?? 0;
+  const unavailable = result.unavailableAttachments ?? 0;
   const attachmentText = captured > 0
     ? ` and downloaded ${captured} file${captured !== 1 ? 's' : ''}`
     : '';
-  return `${count} message${count !== 1 ? 's' : ''}${attachmentText} captured from ${source}.`;
+  const unavailableNames = conversation?.messages.flatMap((message) =>
+    (message.attachments ?? []).filter((attachment) => attachment.captureError).map((attachment) => attachment.name || 'unnamed file')
+  ) ?? [];
+  const warning = unavailable > 0
+    ? ` ${unavailable} original file${unavailable === 1 ? '' : 's'} unavailable${unavailableNames.length ? `: ${unavailableNames.join(', ')}` : ''}. Select Add file below if you have a copy.`
+    : '';
+  return { message: `${count} message${count !== 1 ? 's' : ''}${attachmentText} captured from ${source}.${warning}`, partial: unavailable > 0 };
 }
 
-async function actionPaste(): Promise<string> {
-  const adapter = getTargetAdapter();
-  if (!adapter) throw new Error('This page is not supported for pasting.');
-
-  const result = await msgBg<{ payload?: CanonicalConversation | null; error?: string }>({
-    type: 'FETCH_TRANSCRIPT'
-  });
-
-  const transcript = result?.payload;
-  if (!transcript) throw new Error('No captured chat found. Extract a chat first.');
-
-  // Prefer file-based injection when the adapter supports it (e.g. Manus)
-  let success: boolean;
-  if (typeof adapter.injectViaFile === 'function') {
-    success = await adapter.injectViaFile(transcript);
-    if (!success) throw new Error('File attachment failed. Try clicking the chat input first and retry.');
-    return formatPasteResult('Transcript attached as a text file.', await attachCapturedFiles());
+function injectionFeedback(base: string, response: InjectionResponse): ActionFeedback {
+  if (response.status !== 'success' && response.status !== 'partial') {
+    throw new Error(response.error || 'Could not paste into this chat.');
   }
-
-  const prompt = adapter.generateSingleShotPrompt(transcript);
-  success = adapter.injectPrompt(prompt);
-  if (!success) throw new Error('Could not inject into the text box. Try clicking the input area first.');
-  return formatPasteResult('Chat injected into the text box.', await attachCapturedFiles());
-}
-
-/** Try to attach a File object to the page via DataTransfer (file input or drag-drop). */
-function tryAttachFile(file: File): boolean {
-  return tryAttachFiles([file]);
-}
-
-function tryAttachFiles(files: File[]): boolean {
-  if (files.length === 0) return true;
-
-  const buildDataTransfer = () => {
-    const dt = new DataTransfer();
-    files.forEach((file) => dt.items.add(file));
-    return dt;
+  return {
+    message: formatInjectionFeedback(base, response),
+    partial: response.status === 'partial',
   };
-
-  // Strategy 1: programmatic file input
-  const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
-  for (const inp of fileInputs) {
-    if (inp.disabled) continue;
-    try {
-      const dt = buildDataTransfer();
-      inp.files = dt.files;
-      inp.dispatchEvent(new Event('change', { bubbles: true }));
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
-    } catch { /* try next */ }
-  }
-  // Strategy 2: synthetic drag-drop on the composer
-  const dropSelectors = [
-    '.ProseMirror', '[data-lexical-editor]', '[role="textbox"]',
-    'textarea', 'div[contenteditable]', '[data-testid*="composer"]',
-    '[data-testid*="input"]', 'form', 'main',
-  ];
-  for (const sel of dropSelectors) {
-    const el = document.querySelector(sel);
-    if (!el) continue;
-    try {
-      const dt = buildDataTransfer();
-      el.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
-      el.dispatchEvent(new DragEvent('dragover',  { dataTransfer: dt, bubbles: true, cancelable: true }));
-      el.dispatchEvent(new DragEvent('drop',      { dataTransfer: dt, bubbles: true, cancelable: true }));
-      return true;
-    } catch { /* try next */ }
-  }
-  return false;
 }
 
-function blobRecordToFile(blob: AttachmentBlob): File {
-  const binary = atob(blob.dataBase64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return new File([bytes.buffer as ArrayBuffer], blob.name || `attachment-${blob.alias}`, {
-    type: blob.mimeType || 'application/octet-stream'
-  });
+async function actionPaste(): Promise<ActionFeedback> {
+  return injectionFeedback('Transcript added to the composer.', await injectTransfer({ type: 'INJECT' }));
 }
 
-async function fetchCapturedAttachmentBlobs(): Promise<AttachmentBlob[]> {
-  const resp = await msgBg<{ blobs?: AttachmentBlob[] }>({ type: 'FETCH_ATTACHMENTS' });
-  return Array.isArray(resp?.blobs) ? resp.blobs : [];
-}
-
-async function attachCapturedFiles(): Promise<{ total: number; attached: number; failed: number }> {
-  const blobs = await fetchCapturedAttachmentBlobs();
-  const files = blobs.map(blobRecordToFile);
-  const attached = tryAttachFiles(files) ? files.length : 0;
-  if (attached > 0) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 500));
-  }
-  return { total: blobs.length, attached, failed: blobs.length - attached };
-}
-
-function formatPasteResult(base: string, result: { total: number; attached: number; failed: number }): string {
-  if (result.total === 0) return base;
-  if (result.failed === 0) {
-    return `${base} Attached ${result.attached} captured file${result.attached !== 1 ? 's' : ''}.`;
-  }
-  return `${base} Attached ${result.attached}/${result.total} captured file(s); click the target input/upload area and retry if any are missing.`;
-}
-
-/** Paste raw message text with no system-prompt framing. */
-async function actionPasteRaw(): Promise<string> {
-  const adapter = getTargetAdapter();
-  if (!adapter) throw new Error('This page is not supported for pasting.');
-
-  const result = await msgBg<{ payload?: CanonicalConversation | null }>({ type: 'FETCH_TRANSCRIPT' });
-  const transcript = result?.payload;
-  if (!transcript) throw new Error('No captured chat found. Capture a chat first.');
-
-  const raw = transcript.messages.map((m) => {
-    const role = m.role === 'user' ? 'User' : 'Assistant';
-    const text = m.content.map((c) => c.text).join('\n').trim();
-    return `${role}:\n${text}`;
-  }).join('\n\n');
-
-  const success = adapter.injectPrompt(raw);
-  if (!success) throw new Error('Could not inject into the text box. Try clicking the input area first.');
-  return formatPasteResult('Raw transcript injected into the text box.', await attachCapturedFiles());
+async function actionPasteRaw(): Promise<ActionFeedback> {
+  return injectionFeedback('Raw transcript added to the composer.', await injectTransfer({ type: 'INJECT_RAW' }));
 }
 
 /** Build a file and try to attach it to the page; fall back to download. */
-async function actionPasteAsFile(fmt: AttachFormat): Promise<string> {
-  const transcript = await fetchTranscript();
+async function actionPasteAsFile(fmt: AttachFormat): Promise<ActionFeedback> {
+  const snapshot = await msgBg<{ payload?: CanonicalConversation | null; transferId?: string }>({ type: 'FETCH_TRANSCRIPT' });
+  const transcript = snapshot.payload;
+  if (!transcript) throw new Error('No captured chat found. Capture a chat first.');
   const base = safeName(transcript.metadata.title);
 
   let blob: Blob;
@@ -291,15 +120,22 @@ async function actionPasteAsFile(fmt: AttachFormat): Promise<string> {
     filename = `${base}.pdf`;
   }
 
-  const file = new File([blob], filename, { type: blob.type });
-  const attached = tryAttachFile(file);
-  if (attached) {
-    return formatPasteResult(`${fmt.toUpperCase()} file attached to the chat input.`, await attachCapturedFiles());
+  const response = await injectTransfer({
+    type: 'INJECT_FILE',
+    base64: await blobToBase64(blob),
+    filename,
+    mimeType: blob.type,
+    transferId: snapshot.transferId,
+  });
+  if (response.status === 'success' || response.status === 'partial') {
+    return injectionFeedback(`${fmt.toUpperCase()} transcript added to the composer.`, response);
   }
 
-  // Fallback: trigger download so user can attach manually
   triggerDownload(blob, filename);
-  return `${fmt.toUpperCase()} downloaded — attach it to the chat input manually.`;
+  return {
+    message: `${fmt.toUpperCase()} transcript downloaded. ${response.error || 'Use the target upload control to attach it.'} Original files were not added.`,
+    partial: true,
+  };
 }
 
 async function actionSummarize(): Promise<string> {
@@ -540,6 +376,16 @@ const STYLES = `
   .feedback.success { background: #0d2a18; border: 1px solid #1f5a2d; color: #3fb950; }
   .feedback.error   { background: #2a0d0d; border: 1px solid #5a1f1f; color: #f85149; }
   .feedback.info    { background: #0d1a2a; border: 1px solid #1f3a5a; color: #79c0ff; }
+
+  .missing-attachments { margin: 0 10px 10px; padding: 8px; border: 1px solid #30363d; border-radius: 8px; }
+  .missing-attachments[hidden] { display: none; }
+  .missing-attachments h3 { color: #c9d1d9; font-size: 12px; margin-bottom: 6px; }
+  .missing-attachment-list { max-height: 125px; overflow: auto; }
+  .missing-attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 3px 0; }
+  .missing-attachment-row span { min-width: 0; overflow-wrap: anywhere; color: #c9d1d9; font-size: 12px; }
+  .missing-attachment-row button { flex-shrink: 0; border: 1px solid #30363d; border-radius: 5px; padding: 4px 7px; background: #21262d; color: #c9d1d9; font: inherit; font-size: 11px; cursor: pointer; }
+  .missing-attachment-row button:hover:not(:disabled) { border-color: #58a6ff; }
+  .missing-attachment-row button:disabled { opacity: 0.5; cursor: default; }
 
   .summary-area {
     margin: 0 10px 10px;
@@ -875,7 +721,8 @@ function injectToolbar() {
   // Host element
   const host = document.createElement('div');
   host.id = 'llm-chat-transfer-toolbar';
-  const shadow = host.attachShadow({ mode: 'open' });
+  // Keep the local file picker inaccessible to scripts running on the host page.
+  const shadow = host.attachShadow({ mode: 'closed' });
 
   // Styles
   const styleEl = document.createElement('style');
@@ -951,7 +798,10 @@ function injectToolbar() {
         Download
       </button>
     </div>
-    <div class="feedback" id="tb-feedback"></div>
+    <div class="feedback" id="tb-feedback" role="status"></div>
+    <section class="missing-attachments" id="tb-missing-attachments" aria-labelledby="tb-missing-heading" hidden>
+      <h3 id="tb-missing-heading">Missing files</h3>
+    </section>
     <div class="summary-area" id="tb-summary"></div>
     <div class="format-picker" id="tb-format-picker">
       <div class="format-picker-title">Download as…</div>
@@ -1047,6 +897,11 @@ function injectToolbar() {
   let panelOpen = false;
   let cachedSummary: string | null = null;
   let activeHistoryId: string | null = null;
+  const refreshMissingFiles = mountMissingAttachmentPicker(
+    shadow.getElementById('tb-missing-attachments')!,
+    msgBg,
+    (message, state) => showFeedback(message, state, state === 'success'),
+  );
 
   // ── Status refresh ──────────────────────────────────────────────────────────
   async function refreshStatus() {
@@ -1065,6 +920,7 @@ function injectToolbar() {
       btnSummarize.disabled = true;
       btnDownload.disabled = true;
     }
+    await refreshMissingFiles();
   }
 
   // ── Feedback helpers ────────────────────────────────────────────────────────
@@ -1135,16 +991,17 @@ function injectToolbar() {
     btnResync.className = 'summary-resync';
     setLoading(btnExtract, 'Capturing…', extractOrig, true);
     try {
-      const msg = await actionExtract();
+      const result = await actionExtract();
+      const msg = result.message;
       await refreshStatus();
       // Auto-summarize silently after capture
-      showFeedback(`✓ ${msg} — summarizing…`, 'info', false);
+      showFeedback(result.partial ? msg : `${msg} Summarizing…`, 'info', false);
       try {
         cachedSummary = await actionSummarize();
-        showFeedback(`✓ ${msg} — summary ready.`, 'success');
+        if (!result.partial) showFeedback(`${msg} Summary ready.`, 'success');
       } catch {
         // Summarization failed silently; user can retry manually
-        showFeedback(`✓ ${msg}`, 'success');
+        if (!result.partial) showFeedback(msg, 'success');
       }
     } catch (err) {
       showFeedback(`✗ ${err instanceof Error ? err.message : String(err)}`, 'error');
@@ -1176,16 +1033,16 @@ function injectToolbar() {
     const pasteOrig = btnPaste.innerHTML;
     setLoading(btnPaste, 'Pasting…', pasteOrig, true);
     try {
-      let msg: string;
+      let result: ActionFeedback;
       if (mode === 'inline') {
-        msg = await actionPaste();
+        result = await actionPaste();
       } else if (mode === 'raw') {
-        msg = await actionPasteRaw();
+        result = await actionPasteRaw();
       } else {
         // 'pdf' | 'txt' | 'doc'
-        msg = await actionPasteAsFile(mode);
+        result = await actionPasteAsFile(mode);
       }
-      showFeedback(`✓ ${msg}`, 'success');
+      showFeedback(result.message, result.partial ? 'info' : 'success', !result.partial);
     } catch (err) {
       showFeedback(`✗ ${err instanceof Error ? err.message : String(err)}`, 'error');
     } finally {

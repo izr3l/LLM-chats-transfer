@@ -10,12 +10,14 @@ export interface AttachmentRef {
   url?: string;
   mimeType?: string;
   sourceHint?: string;
-  /** Numeric alias used as a placeholder in transcript text; stripped on paste (user must re-upload files manually). */
+  /** Numeric alias linking this reference to its original file in attachment storage. */
   blobAlias?: number;
   /** Size in bytes of the captured blob (for display purposes). */
   blobSize?: number;
   /** Inline text content extracted directly from the DOM (for files rendered in-page). */
   textContent?: string;
+  /** Why the original file could not be captured; reference and rendered text are retained. */
+  captureError?: string;
 }
 
 /**
@@ -93,6 +95,19 @@ export function isValidCanonicalConversation(value: unknown): value is Canonical
       const b = block as Record<string, unknown>;
       if (b.type !== 'text/markdown') return false;
       if (typeof b.text !== 'string') return false;
+    }
+    if (m.attachments !== undefined) {
+      if (!Array.isArray(m.attachments)) return false;
+      for (const attachment of m.attachments) {
+        if (!attachment || typeof attachment !== 'object') return false;
+        const a = attachment as Record<string, unknown>;
+        if (typeof a.id !== 'string' || !['image', 'file', 'link'].includes(a.kind as string)) return false;
+        for (const key of ['name', 'url', 'mimeType', 'sourceHint', 'textContent', 'captureError']) {
+          if (a[key] !== undefined && typeof a[key] !== 'string') return false;
+        }
+        if (a.blobAlias !== undefined && (!Number.isSafeInteger(a.blobAlias) || (a.blobAlias as number) < 0)) return false;
+        if (a.blobSize !== undefined && (!Number.isSafeInteger(a.blobSize) || (a.blobSize as number) < 0)) return false;
+      }
     }
   }
 

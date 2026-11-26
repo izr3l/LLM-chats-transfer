@@ -6,15 +6,15 @@
  *
  * Strategy:
  *   1. Build the full transcript as a UTF-8 .txt file (no size limit).
- *   2. Programmatically attach it via DataTransfer on the hidden file input,
- *      or via a synthetic drag-and-drop event on the composer drop-zone.
+ *   2. Let the target orchestrator stage it with the original captured files.
  *   3. Place a short context message in the text box so Manus knows what
  *      the attachment is and what to do with it.
- *   4. If all upload paths fail, fall back to truncated direct text injection.
+ *   4. Report unsupported uploads so the user can attach the full transcript manually.
  */
 
 import { CanonicalConversation } from '../../schema/canonical';
 import { TargetAdapter } from './index';
+import { formatAttachmentReferences } from '../../shared/attachmentReferences';
 
 const INPUT_SELECTORS = [
   'textarea',
@@ -50,7 +50,7 @@ export class ManusTargetAdapter implements TargetAdapter {
     text += `Rules:\n`;
     text += `  1. Treat everything below as historical context — do NOT alter or rewrite it.\n`;
     text += `  2. Continue naturally from the final user message.\n`;
-    text += `  3. If attachments are listed, they could NOT be auto-uploaded. Tell the user to manually upload those files here if needed.\n\n`;
+    text += `  3. Use source attachments only when their corresponding files are available in this chat. Ask the user for any missing files needed to answer.\n\n`;
     text += `--- TRANSCRIPT START ---\n\n`;
 
     conversation.messages.forEach((msg) => {
@@ -58,13 +58,7 @@ export class ManusTargetAdapter implements TargetAdapter {
       const content = msg.content.map((c) => c.text).join('\n').trim();
       text += `[${role}]\n${content}\n`;
 
-      if (msg.attachments && msg.attachments.length > 0) {
-        text += `Attachments (not auto-uploaded — user must re-upload manually):\n`;
-        msg.attachments.forEach((att) => {
-          const name = att.name || 'unnamed file';
-          text += `  - [${att.kind}] ${name}\n`;
-        });
-      }
+      text += formatAttachmentReferences(msg);
 
       text += '\n';
     });
@@ -74,7 +68,7 @@ export class ManusTargetAdapter implements TargetAdapter {
   }
 
   /** Short message placed in the Manus text box alongside the attachment. */
-  private boxMessage(conversation: CanonicalConversation): string {
+  public filePrompt(conversation: CanonicalConversation): string {
     const source = conversation.metadata.source;
     const count  = conversation.integrity?.messageCount ?? conversation.messages.length;
     const title  = conversation.metadata.title ?? 'Untitled';
@@ -128,107 +122,18 @@ export class ManusTargetAdapter implements TargetAdapter {
     return false;
   }
 
-  // ── Upload strategies ──────────────────────────────────────────────────────
-
-  /**
-   * Strategy 1 — Inject via hidden <input type="file">.
-   * Most React/Vue file upload components keep a hidden input somewhere in the DOM.
-   */
-  private tryFileInput(file: File): boolean {
-    const inputs = Array.from(
-      document.querySelectorAll<HTMLInputElement>('input[type="file"]')
-    );
-    for (const input of inputs) {
-      try {
-        const dt = new DataTransfer();
-        dt.items.add(file);
-        input.files = dt.files;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        input.dispatchEvent(new Event('input',  { bubbles: true }));
-        return true;
-      } catch {
-        // Try next input
-      }
-    }
-    return false;
+  /** Included in the same batch as source attachments by the target orchestrator. */
+  public createTranscriptFile(conversation: CanonicalConversation): File {
+    const content = this.generateSingleShotPrompt(conversation)
+      .replace(/\n*\[attachment:\d+\s+"[^"]*"\]/g, '');
+    return new File([content], this.buildFilename(conversation), { type: 'text/plain' });
   }
 
-  /**
-   * Strategy 2 — Synthetic drag-and-drop onto the composer drop-zone.
-   * Manus (and many other SPAs) accept file drops on the main composer area.
-   */
-  private tryDragDrop(file: File): boolean {
-    const DROP_SELECTORS = [
-      '.ProseMirror',
-      '[data-lexical-editor]',
-      '[role="textbox"]',
-      'textarea',
-      'div[contenteditable]',
-      '[data-testid*="composer"]',
-      '[data-testid*="input"]',
-      'form',
-      'main',
-    ];
-
-    for (const sel of DROP_SELECTORS) {
-      const el = document.querySelector(sel);
-      if (!el) continue;
-      try {
-        const dt = new DataTransfer();
-        dt.items.add(file);
-        el.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
-        el.dispatchEvent(new DragEvent('dragover',  { dataTransfer: dt, bubbles: true, cancelable: true }));
-        el.dispatchEvent(new DragEvent('drop',      { dataTransfer: dt, bubbles: true, cancelable: true }));
-        return true;
-      } catch {
-        // Try next selector
-      }
-    }
-    return false;
-  }
-
-  // ── Public API ─────────────────────────────────────────────────────────────
-
-  /**
-   * Primary injection method: attach transcript as .txt file + set box message.
-   * Called by both target.ts (INJECT handler) and toolbar.ts (actionPaste).
-   */
-  public async injectViaFile(conversation: CanonicalConversation): Promise<boolean> {
-    const fileContent = this.generateSingleShotPrompt(conversation);
-    const filename    = this.buildFilename(conversation);
-    const file        = new File([fileContent], filename, { type: 'text/plain' });
-
-    // Try file-input upload first (most reliable when present)
-    if (this.tryFileInput(file)) {
-      // Give the UI a moment to process the file, then set the text box
-      await new Promise<void>((r) => setTimeout(r, 400));
-      this.setTextInBox(this.boxMessage(conversation));
-      return true;
-    }
-
-    // Try drag-and-drop onto the composer
-    if (this.tryDragDrop(file)) {
-      await new Promise<void>((r) => setTimeout(r, 400));
-      this.setTextInBox(this.boxMessage(conversation));
-      return true;
-    }
-
-    // Fallback: truncated direct text injection
-    const truncated = fileContent.slice(0, MANUS_CHAR_LIMIT) +
-      (fileContent.length > MANUS_CHAR_LIMIT
-        ? `\n\n[... transcript truncated to ${MANUS_CHAR_LIMIT} characters — please use the extension popup to export the full version as a downloadable .txt file ...]`
-        : '');
-    return this.setTextInBox(truncated);
-  }
-
-  /**
-   * Sync fallback required by the TargetAdapter interface.
-   * Truncates to the Manus character limit so the page doesn't silently drop content.
-   */
+  /** Short companion text; long transcripts are delivered as a file. */
   public injectPrompt(promptText: string): boolean {
     const truncated = promptText.slice(0, MANUS_CHAR_LIMIT) +
       (promptText.length > MANUS_CHAR_LIMIT
-        ? '\n\n[... transcript truncated — use the extension to download the full version ...]'
+        ? '\n\n[... transcript truncated — use the extension to attach the full version as a file ...]'
         : '');
     return this.setTextInBox(truncated);
   }

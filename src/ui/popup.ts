@@ -11,6 +11,9 @@ import {
   buildPlainText,
   safeName,
 } from '../shared/transcriptExport';
+import { formatInjectionFeedback, InjectionResponse } from '../shared/attachmentFeedback';
+import { mountMissingAttachmentPicker } from '../shared/missingAttachmentPicker';
+import { AttachmentRef } from '../schema/canonical';
 
 console.log("Popup script loaded.");
 
@@ -52,6 +55,7 @@ type HistoryItem = {
 type PreviewMessage = {
   role: string;
   content: Array<{ text: string }>;
+  attachments?: AttachmentRef[];
 };
 
 type PreviewPayload = {
@@ -102,6 +106,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const extractBtn = document.getElementById('extractBtn') as HTMLButtonElement;
   const injectBtn = document.getElementById('injectBtn') as HTMLButtonElement;
   const statusDiv = document.getElementById('status') as HTMLDivElement;
+  const refreshMissingFiles = mountMissingAttachmentPicker(
+    document.getElementById('missingAttachments')!,
+    (message) => chrome.runtime.sendMessage(message),
+    (message, state) => {
+      statusDiv.textContent = message;
+      statusDiv.className = state === 'info' ? 'status-box status' : `status-box status ${state}`;
+    },
+  );
   const historyListDiv = document.getElementById('historyList') as HTMLDivElement;
   const clearHistoryBtn = document.getElementById('clearHistoryBtn') as HTMLButtonElement;
   const seeAllHistoryBtn = document.getElementById('seeAllHistoryBtn') as HTMLButtonElement;
@@ -369,6 +381,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       renderPageDetect(provider, hasTranscript, transcriptSource);
     });
+    void refreshMissingFiles();
   }
 
   void initPageDetect();
@@ -388,14 +401,11 @@ document.addEventListener('DOMContentLoaded', () => {
       if (response.status === 'success') {
         const info = response.data as PreviewPayload | undefined;
         const msgCount = info?.integrity?.messageCount ?? 0;
-        const attachmentCount = Array.isArray(info?.messages)
-          ? info.messages.reduce((sum: number, msg: PreviewMessage) => {
-            const attachments = (msg as Record<string, unknown>).attachments;
-            return sum + (Array.isArray(attachments) ? attachments.length : 0);
-          }, 0)
-          : 0;
-        statusDiv.textContent = `Extracted ${msgCount} messages and ${attachmentCount} attachments. Ready to inject.`;
-        statusDiv.className = 'status-box status success';
+        const captured = typeof response.capturedAttachments === 'number' ? response.capturedAttachments : 0;
+        const unavailable = typeof response.unavailableAttachments === 'number' ? response.unavailableAttachments : 0;
+        statusDiv.textContent = `Captured ${msgCount} messages and ${captured} original files.` +
+          (unavailable > 0 ? ` ${unavailable} originals unavailable. Select Add file below if you have a copy.` : ' Ready to paste.');
+        statusDiv.className = unavailable > 0 ? 'status-box status' : 'status-box status success';
         injectBtn.disabled = false;
         refreshHistory();
         runSummarize(true);
@@ -417,8 +427,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ========== INJECT (with preview/consent modal) ==========
+  let previewTransferId: string | undefined;
   function closeModal() {
     previewModal.classList.remove('visible');
+    previewTransferId = undefined;
   }
 
   function truncateText(text: string, maxLen: number): string {
@@ -447,6 +459,14 @@ document.addEventListener('DOMContentLoaded', () => {
         : '';
       textSpan.textContent = truncateText(fullText, 200);
       previewContent.appendChild(textSpan);
+      for (const attachment of msg.attachments ?? []) {
+        if (attachment.kind === 'link') continue;
+        const fileSpan = document.createElement('span');
+        fileSpan.className = 'preview-text';
+        const state = attachment.blobAlias !== undefined ? 'original saved' : 'original unavailable';
+        fileSpan.textContent = `${attachment.name || 'unnamed file'} — ${state}${attachment.captureError ? `: ${attachment.captureError}` : ''}`;
+        previewContent.appendChild(fileSpan);
+      }
     });
 
     if ((transcript.messages?.length ?? 0) > 10) {
@@ -492,6 +512,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         statusDiv.textContent = 'Review the transcript before injecting.';
         statusDiv.className = 'status-box status';
+        previewTransferId = typeof response.transferId === 'string' ? response.transferId : undefined;
         showPreviewModal(transcript);
       });
       return;
@@ -507,16 +528,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (mode === 'raw') {
         const response = await sendTabMessage(tabId, { type: 'INJECT_RAW' });
-        if (response.status === 'success') {
-          statusDiv.textContent = 'Raw transcript injected. You can now press Send.';
-          statusDiv.className = 'status-box status success';
+        if (response.status === 'success' || response.status === 'partial') {
+          statusDiv.textContent = formatInjectionFeedback('Raw transcript added to the composer.', response as InjectionResponse);
+          statusDiv.className = response.status === 'partial' ? 'status-box status' : 'status-box status success';
         } else {
           statusDiv.textContent = (response.error as string | undefined) ?? 'Injection failed.';
           statusDiv.className = 'status-box status error';
         }
       } else {
         // pdf | txt | doc — build file locally, send as base64
-        const result = await new Promise<{ payload?: TranscriptLike | null }>((resolve) => {
+        const result = await new Promise<{ payload?: TranscriptLike | null; transferId?: string }>((resolve) => {
           chrome.runtime.sendMessage({ type: 'FETCH_TRANSCRIPT' }, resolve);
         });
         const transcript = result?.payload;
@@ -549,15 +570,16 @@ document.addEventListener('DOMContentLoaded', () => {
           base64,
           filename,
           mimeType: blob.type,
+          transferId: result.transferId,
         });
 
-        if (response.status === 'success') {
-          statusDiv.textContent = `${mode.toUpperCase()} file attached to the chat input.`;
-          statusDiv.className = 'status-box status success';
+        if (response.status === 'success' || response.status === 'partial') {
+          statusDiv.textContent = formatInjectionFeedback(`${mode.toUpperCase()} transcript added to the composer.`, response as InjectionResponse);
+          statusDiv.className = response.status === 'partial' ? 'status-box status' : 'status-box status success';
         } else {
           // Fallback: download the file
           triggerDownload(blob, filename);
-          statusDiv.textContent = `${mode.toUpperCase()} downloaded — attach it to the chat input manually.`;
+          statusDiv.textContent = `${mode.toUpperCase()} transcript downloaded. ${typeof response.error === 'string' ? response.error : 'Use the target upload control to attach it.'} Original files were not added.`;
           statusDiv.className = 'status-box status';
         }
       }
@@ -568,6 +590,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   confirmInjectBtn.addEventListener('click', async () => {
+    const transferId = previewTransferId;
     closeModal();
     statusDiv.textContent = 'Injecting...';
     statusDiv.className = 'status-box status';
@@ -575,12 +598,11 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const tabId = await injectContentScript('content-target.js');
       await new Promise((r) => setTimeout(r, 100));
-      const response = await sendTabMessage(tabId, { type: 'INJECT' });
+      const response = await sendTabMessage(tabId, { type: 'INJECT', transferId });
 
-      if (response.status === 'success') {
-        statusDiv.textContent = 'Injected successfully. You can now press Send.';
-        statusDiv.className = 'status-box status success';
-        injectBtn.disabled = true;
+      if (response.status === 'success' || response.status === 'partial') {
+        statusDiv.textContent = formatInjectionFeedback('Transcript added to the composer.', response as InjectionResponse);
+        statusDiv.className = response.status === 'partial' ? 'status-box status' : 'status-box status success';
       } else {
         const errMsg = typeof response.error === 'string' ? response.error : 'Injection failed.';
         if (errMsg.includes('Receiving end does not exist')) {
@@ -790,6 +812,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (action === 'summarize') {
       chrome.runtime.sendMessage({ type: 'LOAD_HISTORY_ITEM', id: historyId }, (result) => {
         if (result?.status === 'success') {
+          void refreshMissingFiles();
           showView('summarize');
           runSummarize(true);
         } else {
@@ -1061,6 +1084,7 @@ document.addEventListener('DOMContentLoaded', () => {
           statusDiv.className = 'status-box status error';
           return;
         }
+        void refreshMissingFiles();
         chrome.runtime.sendMessage({ type: 'PREVIEW_TRANSCRIPT' }, (resp) => {
           const transcript = resp?.payload as TranscriptLike | null;
           if (!transcript) {

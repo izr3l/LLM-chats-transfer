@@ -1,7 +1,8 @@
 // Background script handles cross-tab messages and encrypted persistence.
 
 import { AttachmentBlob, CanonicalConversation, isValidCanonicalConversation, MAX_PAYLOAD_SIZE } from '../schema/canonical';
-import { putBlobs, getBlobsByTransfer, getBlob, deleteBlobsByTransfer } from './attachmentStore';
+import { putBlobs, getBlobsByTransfer, getBlob, deleteBlob, deleteBlobsByTransfer, MAX_BLOB_SIZE, validateAttachmentBlobs } from './attachmentStore';
+import { ATTACHMENT_HOSTS, downloadAttachment } from './attachmentDownload';
 
 type EncryptedPacket = { iv: string; ciphertext: string };
 
@@ -39,6 +40,8 @@ type StoredAiConfig = { providerId: string; encryptedKey?: EncryptedPacket };
 
 type TransferHistoryEntry = {
   id: string;
+  /** Stable file-store key; retained when a history item becomes active again. */
+  attachmentTransferId?: string;
   createdAt: string;
   source: string;
   title: string;
@@ -50,6 +53,12 @@ type TransferHistoryEntry = {
 
 const rateLimiter = new Map<string, number>();
 const RATE_LIMIT_MS = 500;
+const ATTACHMENT_MESSAGES = new Set([
+  'DOWNLOAD_ATTACHMENT_URL', 'DOWNLOAD_IN_PAGE', 'HARVEST_FIBER_URLS',
+  'STORE_ATTACHMENTS', 'FETCH_ATTACHMENTS', 'FETCH_ATTACHMENT',
+  'DISCARD_STAGED_ATTACHMENTS', 'RESTORE_CAPTURE_ATTACHMENT',
+  'FETCH_TRANSCRIPT', 'PREVIEW_TRANSCRIPT', 'HAS_TRANSCRIPT',
+]);
 
 function isRateLimited(type: string): boolean {
   const lastCall = rateLimiter.get(type) ?? 0;
@@ -281,7 +290,7 @@ async function getHistory(): Promise<TransferHistoryEntry[]> {
   })) as TransferHistoryEntry[];
 }
 
-function toHistoryEntry(payload: CanonicalConversation, encrypted: EncryptedPacket): TransferHistoryEntry {
+function toHistoryEntry(payload: CanonicalConversation, encrypted: EncryptedPacket, transferId: string): TransferHistoryEntry {
   const count = payload.integrity?.messageCount ?? payload.messages.length;
 
   const attachmentCount = payload.messages.reduce((sum: number, msg) => {
@@ -292,7 +301,8 @@ function toHistoryEntry(payload: CanonicalConversation, encrypted: EncryptedPack
   }, 0);
 
   return {
-    id: typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: transferId,
+    attachmentTransferId: transferId,
     createdAt: new Date().toISOString(),
     source: payload.metadata.source ?? 'unknown',
     title: payload.metadata.title ?? 'Untitled chat',
@@ -303,11 +313,106 @@ function toHistoryEntry(payload: CanonicalConversation, encrypted: EncryptedPack
   };
 }
 
+async function isReferencedTransfer(transferId: string): Promise<boolean> {
+  const { activeTransferId } = await chrome.storage.local.get(['activeTransferId']);
+  if (activeTransferId === transferId) return true;
+  return (await getHistory()).some((item) => (item.attachmentTransferId || item.id) === transferId);
+}
+
+function isValidTransferId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(value);
+}
+
+// Keep reads and writes of the active transfer and history together when
+// several tabs capture, restore files, or change the selected conversation.
+let transferWrites: Promise<unknown> = Promise.resolve();
+
+function withTransferWrite<T>(write: () => Promise<T>): Promise<T> {
+  const next = transferWrites.then(write);
+  transferWrites = next.catch(() => undefined);
+  return next;
+}
+
+async function restoreCaptureAttachment(request: {
+  transferId?: unknown;
+  messageId?: unknown;
+  attachmentId?: unknown;
+  file?: unknown;
+}): Promise<{ status: 'success'; transferId: string; name: string }> {
+  const { transferId, messageId, attachmentId, file } = request;
+  if (!isValidTransferId(transferId) || typeof messageId !== 'string' || typeof attachmentId !== 'string' ||
+      !file || typeof file !== 'object') {
+    throw new Error('Select a missing attachment and choose its original file.');
+  }
+
+  const { activeTransferId, pendingTransferEncrypted } =
+    await chrome.storage.local.get(['activeTransferId', 'pendingTransferEncrypted']);
+  if (activeTransferId !== transferId || !isEncryptedPacket(pendingTransferEncrypted)) {
+    throw new Error('The selected capture changed. Select the capture again before adding its file.');
+  }
+  const payload = await decryptPayload(pendingTransferEncrypted);
+  const ref = payload?.messages.find((message) => message.id === messageId)
+    ?.attachments?.find((attachment) => attachment.id === attachmentId);
+  if (!payload || !ref || ref.kind === 'link') {
+    throw new Error('This attachment is no longer in the selected capture.');
+  }
+  if (ref.blobAlias !== undefined) {
+    throw new Error('This capture already has a file for that attachment.');
+  }
+
+  const attachments = payload.messages.flatMap((message) => message.attachments ?? [])
+    .filter((attachment) => attachment.kind !== 'link');
+  const highestAlias = attachments.reduce((highest, attachment) => Math.max(highest, attachment.blobAlias ?? 0), 0);
+  let alias = highestAlias + 1;
+  // Skip any unreferenced blob left by a failed or older capture.
+  while (Number.isSafeInteger(alias) && await getBlob(transferId, alias)) alias += 1;
+  const { name, mimeType, dataBase64, size } = file as AttachmentBlob;
+  const blob = { transferId, alias, name, mimeType, dataBase64, size };
+  validateAttachmentBlobs([blob]);
+
+  ref.name = name;
+  ref.mimeType = mimeType;
+  ref.blobAlias = blob.alias;
+  ref.blobSize = size;
+  delete ref.captureError;
+  const unavailable = attachments.filter((attachment) => attachment.blobAlias === undefined).length;
+  const captured = new Set(attachments.flatMap((attachment) =>
+    attachment.blobAlias === undefined ? [] : [attachment.blobAlias])).size;
+  payload.metadata.updatedAt = new Date().toISOString();
+  payload.metadata.extensions = {
+    ...payload.metadata.extensions,
+    attachmentCount: String(attachments.length),
+    capturedAttachments: String(captured),
+    unavailableAttachments: String(unavailable),
+    attachmentMode: unavailable > 0 ? 'partial' : 'original-files',
+  };
+
+  const serialized = JSON.stringify({ metadata: payload.metadata, messages: payload.messages });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(serialized));
+  const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  payload.integrity = { messageCount: payload.messages.length, sha256 };
+  if (JSON.stringify(payload).length > MAX_PAYLOAD_SIZE) throw new Error('The capture exceeds the 5 MB transcript limit.');
+
+  const encrypted = await encryptPayload(payload);
+  const history = await getHistory();
+  const nextHistory = history.map((entry) => (entry.attachmentTransferId || entry.id) === transferId
+    ? { ...entry, encrypted, sha256 }
+    : entry);
+  await putBlobs([blob]);
+  try {
+    await chrome.storage.local.set({ pendingTransferEncrypted: encrypted, transferHistory: nextHistory });
+  } catch (error) {
+    await deleteBlob(transferId, blob.alias).catch(console.warn);
+    throw error;
+  }
+  return { status: 'success', transferId, name };
+}
+
 // --- Main message handler ---
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   const messageType = typeof request?.type === 'string' ? request.type : '';
-  if (messageType && isRateLimited(messageType)) {
+  if (messageType && !ATTACHMENT_MESSAGES.has(messageType) && isRateLimited(messageType)) {
     sendResponse({ status: 'error', error: 'Rate limited. Please wait.' });
     return true;
   }
@@ -317,8 +422,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  if (request.type === 'STORE_TRANSCRIPT') {
+  if (request.type === 'CAPTURE_ACTIVE_TAB') {
     (async () => {
+      try {
+        const sourceTab = sender.tab ?? (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+        if (sourceTab?.id === undefined || !isAllowedSender({ id: sender.id, tab: sourceTab } as chrome.runtime.MessageSender)) {
+          throw new Error('Open a supported AI conversation before capturing.');
+        }
+        await chrome.scripting.executeScript({ target: { tabId: sourceTab.id }, files: ['content-source.js'] });
+        const result = await chrome.tabs.sendMessage(sourceTab.id, { type: 'EXTRACT' });
+        sendResponse(result ?? { status: 'error', error: 'Capture returned no response. Refresh the source page and try again.' });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        sendResponse({ status: 'error', error: `${message} Refresh the source page and try Capture again.` });
+      }
+    })();
+    return true;
+  }
+
+  if (request.type === 'STORE_TRANSCRIPT') {
+    void withTransferWrite(async () => {
       try {
         if (!isValidCanonicalConversation(request.payload)) {
           sendResponse({ status: 'error', error: 'Invalid payload: schema validation failed.' });
@@ -331,14 +454,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return;
         }
 
+        const hasStagedFiles = request.stagedTransferId !== undefined;
+        if (hasStagedFiles && !isValidTransferId(request.stagedTransferId)) throw new Error('Invalid staged transfer ID.');
+        const transferId = hasStagedFiles ? request.stagedTransferId as string
+          : typeof crypto.randomUUID === 'function' ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        if (hasStagedFiles && await isReferencedTransfer(transferId)) throw new Error('Transfer is already published.');
+
+        if (request.blobs !== undefined && !Array.isArray(request.blobs)) throw new Error('Invalid attachments.');
+        if (hasStagedFiles && request.blobs?.length) throw new Error('Cannot combine staged and inline attachments.');
+        const blobs = hasStagedFiles ? await getBlobsByTransfer(transferId)
+          : (request.blobs ?? []).map((blob: AttachmentBlob) => ({ ...blob, transferId })) as AttachmentBlob[];
+        validateAttachmentBlobs(blobs);
+        // Every captured alias must resolve before the transcript becomes visible.
+        const aliases = new Set(blobs.map((blob) => blob.alias));
+        for (const message of (request.payload as CanonicalConversation).messages) {
+          for (const attachment of message.attachments ?? []) {
+            if (attachment.blobAlias !== undefined && !aliases.has(attachment.blobAlias)) {
+              throw new Error(`Missing file data for attachment "${attachment.name || attachment.id}".`);
+            }
+          }
+        }
+
         const encryptedTranscript = await encryptPayload(request.payload);
 
-        const transferId = typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-        const historyEntry = toHistoryEntry(request.payload as CanonicalConversation, encryptedTranscript);
+        const historyEntry = toHistoryEntry(request.payload as CanonicalConversation, encryptedTranscript, transferId);
         const existingHistory = await getHistory();
+        const previousHistory = [...existingHistory];
+        const { activeTransferId: previousActiveId } = await chrome.storage.local.get(['activeTransferId']);
 
         // If a chat with the same source + title already exists, replace it
         const duplicateIndex = existingHistory.findIndex(
@@ -354,49 +497,78 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         const payloadMeta = request.payload as CanonicalConversation;
-        await chrome.storage.local.set({
-          pendingTransferEncrypted: encryptedTranscript,
-          activeTransferId: transferId,
-          transferHistory: nextHistory,
-          pendingTransferMeta: {
-            source: payloadMeta.metadata.source ?? 'unknown',
-            title: payloadMeta.metadata.title ?? 'Untitled'
-          }
-        });
+        if (!hasStagedFiles) await putBlobs(blobs);
+        try {
+          await chrome.storage.local.set({
+            pendingTransferEncrypted: encryptedTranscript,
+            activeTransferId: transferId,
+            transferHistory: nextHistory,
+            pendingTransferMeta: {
+              source: payloadMeta.metadata.source ?? 'unknown',
+              title: payloadMeta.metadata.title ?? 'Untitled'
+            }
+          });
+        } catch (error) {
+          await deleteBlobsByTransfer(transferId).catch(() => undefined);
+          throw error;
+        }
+
+        // A replacement or history trim also releases its now-unreferenced files.
+        const keptIds = new Set(nextHistory.map((item) => item.attachmentTransferId || item.id));
+        for (const old of previousHistory) {
+          const oldTransferId = old.attachmentTransferId || old.id;
+          if (!keptIds.has(oldTransferId)) await deleteBlobsByTransfer(oldTransferId).catch(console.warn);
+        }
+        if (typeof previousActiveId === 'string' && !keptIds.has(previousActiveId)) {
+          await deleteBlobsByTransfer(previousActiveId).catch(console.warn);
+        }
 
         sendResponse({ status: 'success', transferId });
       } catch (error) {
         sendResponse({ status: 'error', error: String(error) });
       }
-    })();
+    });
 
+    return true;
+  }
+
+  if (request.type === 'RESTORE_CAPTURE_ATTACHMENT') {
+    void withTransferWrite(() => restoreCaptureAttachment(request)).then(sendResponse, (error: unknown) => {
+      sendResponse({ status: 'error', error: error instanceof Error ? error.message : String(error) });
+    });
     return true;
   }
 
   if (request.type === 'FETCH_TRANSCRIPT') {
     (async () => {
       try {
-        const result = await chrome.storage.local.get(['pendingTransferEncrypted', 'pendingTransfer']);
+        const load = () => chrome.storage.local.get(['pendingTransferEncrypted', 'pendingTransfer', 'activeTransferId']);
+        let result = await load();
 
         if (result.pendingTransfer && !result.pendingTransferEncrypted) {
           try {
-            const encrypted = await encryptPayload(result.pendingTransfer);
-            await chrome.storage.local.set({ pendingTransferEncrypted: encrypted });
-            await chrome.storage.local.remove(['pendingTransfer']);
-            const payload = await decryptPayload(encrypted);
-            sendResponse({ payload: payload ?? null });
+            result = await withTransferWrite(async () => {
+              const current = await load();
+              if (current.pendingTransfer && !current.pendingTransferEncrypted) {
+                try {
+                  current.pendingTransferEncrypted = await encryptPayload(current.pendingTransfer);
+                  await chrome.storage.local.set({ pendingTransferEncrypted: current.pendingTransferEncrypted });
+                } finally {
+                  await chrome.storage.local.remove(['pendingTransfer']);
+                }
+              }
+              return current;
+            });
           } catch {
-            // If migration fails, remove the unsafe plaintext and report error
-            await chrome.storage.local.remove(['pendingTransfer']);
             sendResponse({ payload: null, error: 'Failed to migrate legacy plaintext data.' });
+            return;
           }
-          return;
         }
 
         const payload = isEncryptedPacket(result.pendingTransferEncrypted)
           ? await decryptPayload(result.pendingTransferEncrypted)
           : null;
-        sendResponse({ payload: payload ?? null });
+        sendResponse({ payload: payload ?? null, transferId: result.activeTransferId ?? null });
       } catch (error) {
         sendResponse({ payload: null, error: String(error) });
       }
@@ -436,7 +608,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === 'LOAD_HISTORY_ITEM') {
-    (async () => {
+    void withTransferWrite(async () => {
       const itemId = typeof request.id === 'string' ? request.id : '';
       const history = await getHistory();
       const item = history.find((entry) => entry.id === itemId);
@@ -445,9 +617,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
       }
 
-      const transferId = typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const transferId = item.attachmentTransferId || item.id;
 
       await chrome.storage.local.set({
         pendingTransferEncrypted: item.encrypted,
@@ -458,28 +628,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
       });
       sendResponse({ status: 'success', transferId });
-    })();
+    }).catch((error: unknown) => sendResponse({ status: 'error', error: String(error) }));
 
     return true;
   }
 
   if (request.type === 'CLEAR_HISTORY') {
-    (async () => {
-      await chrome.storage.local.set({ transferHistory: [] });
-      sendResponse({ status: 'success' });
-    })();
+    void withTransferWrite(async () => {
+      try {
+        const history = await getHistory();
+        const { activeTransferId } = await chrome.storage.local.get(['activeTransferId']);
+        await chrome.storage.local.set({ transferHistory: [] });
+        for (const item of history) {
+          const transferId = item.attachmentTransferId || item.id;
+          if (transferId !== activeTransferId) await deleteBlobsByTransfer(transferId);
+        }
+        sendResponse({ status: 'success' });
+      } catch (error) { sendResponse({ status: 'error', error: String(error) }); }
+    });
 
     return true;
   }
 
   if (request.type === 'DELETE_HISTORY_ITEM') {
-    (async () => {
-      const itemId = typeof request.id === 'string' ? request.id : '';
-      const history = await getHistory();
-      const updatedHistory = history.filter((entry) => entry.id !== itemId);
-      await chrome.storage.local.set({ transferHistory: updatedHistory });
-      sendResponse({ status: 'success' });
-    })();
+    void withTransferWrite(async () => {
+      try {
+        const itemId = typeof request.id === 'string' ? request.id : '';
+        const history = await getHistory();
+        const item = history.find((entry) => entry.id === itemId);
+        const updatedHistory = history.filter((entry) => entry.id !== itemId);
+        const { activeTransferId } = await chrome.storage.local.get(['activeTransferId']);
+        await chrome.storage.local.set({ transferHistory: updatedHistory });
+        const transferId = item?.attachmentTransferId || item?.id;
+        if (transferId && transferId !== activeTransferId) await deleteBlobsByTransfer(transferId);
+        sendResponse({ status: 'success' });
+      } catch (error) { sendResponse({ status: 'error', error: String(error) }); }
+    });
 
     return true;
   }
@@ -487,11 +671,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'PREVIEW_TRANSCRIPT') {
     (async () => {
       try {
-        const result = await chrome.storage.local.get(['pendingTransferEncrypted']);
+        const result = await chrome.storage.local.get(['pendingTransferEncrypted', 'activeTransferId']);
         const payload = isEncryptedPacket(result.pendingTransferEncrypted)
           ? await decryptPayload(result.pendingTransferEncrypted)
           : null;
-        sendResponse({ payload: payload ?? null });
+        sendResponse({ payload: payload ?? null, transferId: result.activeTransferId ?? null });
       } catch (error) {
         sendResponse({ payload: null, error: String(error) });
       }
@@ -649,15 +833,17 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
 
   // --- Store captured attachment blobs into IndexedDB ---
   if (request.type === 'STORE_ATTACHMENTS') {
-    (async () => {
+    void withTransferWrite(async () => {
       try {
         const transferId = typeof request.transferId === 'string' ? request.transferId : '';
-        const blobs = Array.isArray(request.blobs) ? request.blobs as AttachmentBlob[] : [];
+        if (!Array.isArray(request.blobs)) throw new Error('Invalid attachments.');
+        const blobs = request.blobs as AttachmentBlob[];
 
-        if (!transferId) {
-          sendResponse({ status: 'error', error: 'Missing transferId.' });
+        if (!isValidTransferId(transferId)) {
+          sendResponse({ status: 'error', error: 'Invalid transferId.' });
           return;
         }
+        if (await isReferencedTransfer(transferId)) throw new Error('Cannot change files of a published transfer.');
         if (blobs.length === 0) {
           sendResponse({ status: 'success', stored: 0 });
           return;
@@ -670,7 +856,21 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
       } catch (error) {
         sendResponse({ status: 'error', error: String(error) });
       }
-    })();
+    });
+    return true;
+  }
+
+  // Discard a failed capture without permitting the deletion of active/history files.
+  if (request.type === 'DISCARD_STAGED_ATTACHMENTS') {
+    void withTransferWrite(async () => {
+      try {
+        const transferId = request.transferId;
+        if (!isValidTransferId(transferId)) throw new Error('Invalid transferId.');
+        if (await isReferencedTransfer(transferId)) throw new Error('Cannot discard a published transfer.');
+        await deleteBlobsByTransfer(transferId);
+        sendResponse({ status: 'success' });
+      } catch (error) { sendResponse({ status: 'error', error: String(error) }); }
+    });
     return true;
   }
 
@@ -684,14 +884,17 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
           : (typeof result.activeTransferId === 'string' ? result.activeTransferId : '');
 
         if (!transferId) {
-          sendResponse({ blobs: [] });
+          sendResponse({ status: 'success', blobs: [] });
           return;
         }
 
         const blobs = await getBlobsByTransfer(transferId);
-        sendResponse({ blobs });
+        if (blobs.reduce((size, blob) => size + blob.dataBase64.length, 0) > 48 * 1024 * 1024) {
+          throw new Error('This transfer contains too much file data for one message. Fetch attachments individually.');
+        }
+        sendResponse({ status: 'success', blobs });
       } catch (error) {
-        sendResponse({ blobs: [], error: String(error) });
+        sendResponse({ status: 'error', blobs: [], error: String(error) });
       }
     })();
     return true;
@@ -731,88 +934,7 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
           return;
         }
 
-        // Validate URL against allowed attachment hosts
-        let hostname: string;
-        try {
-          hostname = new URL(url).hostname;
-        } catch {
-          sendResponse({ status: 'error', error: 'Invalid URL.' });
-          return;
-        }
-
-        const ATTACHMENT_HOSTS = [
-          'oaiusercontent.com',
-          'files.oaiusercontent.com',
-          'chatgpt.com',
-          'chat.openai.com',
-          'claude.ai',
-          'gemini.google.com',
-          'googleapis.com',
-          'googleusercontent.com',
-          'manus.im',
-          'manus.com',
-          'manus.ai',
-          'perplexity.ai',
-          'qwen.ai',
-        ];
-
-        const isAllowed = ATTACHMENT_HOSTS.some(
-          (h) => hostname === h || hostname.endsWith(`.${h}`)
-        );
-
-        if (!isAllowed) {
-          sendResponse({ status: 'error', error: `Host "${hostname}" is not in the attachment allowlist.` });
-          return;
-        }
-
-        const resp = await fetch(url, { credentials: 'omit' });
-        if (!resp.ok) {
-          sendResponse({ status: 'error', error: `HTTP ${resp.status}: ${resp.statusText}` });
-          return;
-        }
-
-        const contentType = resp.headers.get('Content-Type') ?? 'application/octet-stream';
-        const buffer = await resp.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-
-        // Convert to base64
-        let binary = '';
-        bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-        const dataBase64 = btoa(binary);
-
-        // Try to extract filename from Content-Disposition
-        let filename = '';
-        const disposition = resp.headers.get('Content-Disposition') ?? '';
-        if (disposition) {
-          // Try RFC 5987 extended notation first
-          const extMatch = /filename\*\s*=\s*(?:UTF-8|utf-8)'[^']*'([^\s;]+)/i.exec(disposition);
-          if (extMatch) {
-            filename = decodeURIComponent(extMatch[1]);
-          } else {
-            // Standard filename="..." or filename=...
-            const stdMatch = /filename\s*=\s*"?([^";\n]+)"?/i.exec(disposition);
-            if (stdMatch) filename = stdMatch[1].trim();
-          }
-        }
-
-        // Fall back to URL path
-        if (!filename) {
-          try {
-            const urlPath = new URL(url).pathname;
-            const seg = urlPath.split('/').pop();
-            if (seg && seg.includes('.')) filename = decodeURIComponent(seg);
-          } catch { /* ignore */ }
-        }
-
-        if (!filename) filename = 'attachment';
-
-        sendResponse({
-          status: 'success',
-          dataBase64,
-          mimeType: contentType.split(';')[0].trim(),
-          filename,
-          size: bytes.length
-        });
+        sendResponse(await downloadAttachment(url, { maxSize: MAX_BLOB_SIZE, allowedHosts: ATTACHMENT_HOSTS }));
       } catch (error) {
         sendResponse({ status: 'error', error: String(error) });
       }
@@ -824,8 +946,8 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
   if (request.type === 'HARVEST_FIBER_URLS') {
     (async () => {
       try {
-        const tabId = typeof request.tabId === 'number' ? request.tabId : sender.tab?.id;
-        if (!tabId) {
+        const tabId = sender.tab?.id ?? (typeof request.tabId === 'number' ? request.tabId : undefined);
+        if (tabId === undefined) {
           sendResponse({ status: 'error', error: 'No tab ID available.' });
           return;
         }
@@ -833,14 +955,10 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
         const results = await chrome.scripting.executeScript({
           target: { tabId },
           world: 'MAIN',
-          func: () => {
+          args: [ATTACHMENT_HOSTS],
+          func: (allowedHosts: string[]) => {
             // Inline harvester that runs in MAIN world (has access to React internals)
-            const ALLOWED_HOSTS = [
-              'oaiusercontent.com', 'files.oaiusercontent.com',
-              'chatgpt.com', 'chat.openai.com',
-              'claude.ai', 'gemini.google.com',
-              'googleapis.com', 'googleusercontent.com',
-            ];
+            const ALLOWED_HOSTS = allowedHosts;
 
             function isAllowed(url: string): boolean {
               try {
@@ -857,13 +975,18 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
             }
 
             const found = new Map<string, { url: string; name?: string; mimeType?: string }>();
-            const MAX_FIBERS = 15000;
-            const MAX_DEPTH = 20;
-            let fc = 0;
+            const MAX_DEPTH = 12;
+            let examinedObjects = 0;
+            const SKIP_KEYS = new Set([
+              '_owner', '_debugOwner', '_store', 'store', 'state', 'stateNode',
+              'memoizedState', 'memoizedProps', 'pendingProps', 'return', 'alternate',
+              'child', 'sibling', 'parent', 'parentNode', 'parentElement', 'root',
+              'context', '_context', 'dependencies', 'updateQueue',
+            ]);
 
             function scan(obj: unknown, depth: number, vis: Set<unknown>): void {
-              if (depth > MAX_DEPTH || vis.size > 5000) return;
-              if (!obj || typeof obj !== 'object') return;
+              if (depth > MAX_DEPTH || vis.size > 1000 || examinedObjects++ > 20000) return;
+              if (!obj || typeof obj !== 'object' || (typeof Node !== 'undefined' && obj instanceof Node)) return;
               if (vis.has(obj)) return;
               vis.add(obj);
               const r = obj as Record<string, unknown>;
@@ -887,7 +1010,7 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
               if (typeof r['asset_pointer'] === 'string' && (r['asset_pointer'] as string).startsWith('file-service://')) {
                 // The actual download URL may be in a sibling key
                 const dlUrl = r['download_url'] || r['downloadUrl'] || r['url'];
-                if (typeof dlUrl === 'string' && dlUrl.startsWith('https://')) {
+                if (typeof dlUrl === 'string' && isAttUrl(dlUrl)) {
                   if (!found.has(dlUrl)) {
                     found.set(dlUrl, {
                       url: dlUrl,
@@ -898,6 +1021,7 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
                 }
               }
               for (const k of Object.keys(r)) {
+                if (SKIP_KEYS.has(k) || k.startsWith("__react")) continue;
                 const v = r[k];
                 if (typeof v === 'string' && v.startsWith('https://') && isAttUrl(v) && !found.has(v)) {
                   const nm = typeof r['name'] === 'string' ? r['name']
@@ -914,49 +1038,36 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
               }
             }
 
-            function walk(fiber: Record<string, unknown> | null, vis: Set<unknown>): void {
-              if (!fiber || typeof fiber !== 'object' || vis.has(fiber) || fc++ > MAX_FIBERS) return;
-              vis.add(fiber);
-              for (const pk of ['memoizedProps', 'pendingProps']) {
-                const p = fiber[pk];
-                if (p && typeof p === 'object') scan(p, 0, new Set());
-              }
-              // Also scan stateNode (component instance state)
-              const st = fiber['memoizedState'];
-              if (st && typeof st === 'object') scan(st, 0, new Set());
-              const sn = fiber['stateNode'];
-              if (sn && typeof sn === 'object' && !(sn instanceof HTMLElement)) scan(sn, 0, new Set());
-              walk(fiber['child'] as Record<string, unknown> | null, vis);
-              walk(fiber['sibling'] as Record<string, unknown> | null, vis);
-            }
-
-            const sels = [
-              'article[data-testid^="conversation-turn-"]',
-              '[data-message-author-role]', '[data-testid*="message"]',
-              'main article',
+            // Inspect props attached to DOM nodes inside rendered message wrappers.
+            // Never follow fibers upward, sideways, into app stores, or into root state.
+            const selectors = [
+              'article[data-testid^="conversation-turn-"]', '[data-message-author-role]',
+              '[data-message-author]', '[data-is-user]', '[data-testid*="message"]',
+              '.font-user-message', '[class*="font-claude-"]', 'main article',
             ];
-            const els = new Set<Element>();
-            for (const s of sels) document.querySelectorAll(s).forEach((e) => els.add(e));
-            const root = document.getElementById('__next') || document.getElementById('root');
-            if (root) els.add(root);
-
-            for (const el of els) {
-              for (const k of Object.keys(el)) {
-                if (k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')) {
-                  walk((el as unknown as Record<string, unknown>)[k] as Record<string, unknown>, new Set());
+            const elements = new Set<Element>();
+            for (const selector of selectors) {
+              for (const root of document.querySelectorAll(selector)) {
+                if (root.closest('form, [contenteditable="true"], [data-testid*="composer"], [hidden], [aria-hidden="true"]')) continue;
+                if (!root.getClientRects().length) continue;
+                elements.add(root);
+                for (const child of root.querySelectorAll('*')) {
+                  if (elements.size >= 5000) break;
+                  elements.add(child);
                 }
-                if (k.startsWith('__reactProps$')) {
-                  const p = (el as unknown as Record<string, unknown>)[k];
-                  if (p && typeof p === 'object') scan(p, 0, new Set());
+                if (elements.size >= 5000) break;
+              }
+              if (elements.size >= 5000) break;
+            }
+            for (const element of elements) {
+              for (const key of Object.keys(element)) {
+                const value = (element as unknown as Record<string, unknown>)[key];
+                if (key.startsWith('__reactProps$')) scan(value, 0, new Set());
+                if ((key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) && value && typeof value === 'object') {
+                  scan((value as Record<string, unknown>).memoizedProps, 0, new Set());
                 }
               }
             }
-
-            // Also scan __NEXT_DATA__
-            try {
-              const nd = document.getElementById('__NEXT_DATA__');
-              if (nd?.textContent) scan(JSON.parse(nd.textContent), 0, new Set());
-            } catch { /* ignore */ }
 
             return Array.from(found.values());
           }
@@ -978,57 +1089,23 @@ Keep the summary concise but comprehensive. Use markdown formatting (headers, bu
         const url = typeof request.url === 'string' ? request.url : '';
         if (!url) { sendResponse({ status: 'error', error: 'Missing URL.' }); return; }
 
-        const tabId = typeof request.tabId === 'number' ? request.tabId : sender.tab?.id;
-        if (!tabId) { sendResponse({ status: 'error', error: 'No tab ID.' }); return; }
+        // Content scripts may request downloads only in their own source tab.
+        const tabId = sender.tab?.id ?? (typeof request.tabId === 'number' ? request.tabId : undefined);
+        if (tabId === undefined) { sendResponse({ status: 'error', error: 'No tab ID.' }); return; }
+        const sourceTab = sender.tab?.id === tabId ? sender.tab : await chrome.tabs.get(tabId);
+        const pageUrl = sourceTab?.url || sender.url || '';
+        const pageOrigin = new URL(pageUrl).origin;
+        if (!isAllowedSender({ id: sender.id, tab: { id: tabId, url: pageUrl } } as chrome.runtime.MessageSender)) {
+          throw new Error('Unsupported source tab.');
+        }
 
         const results = await chrome.scripting.executeScript({
           target: { tabId },
           world: 'MAIN',
-          args: [url],
-          func: async (fileUrl: string) => {
-            try {
-              const resp = await fetch(fileUrl, { credentials: 'include' });
-              if (!resp.ok) return { status: 'error', error: `HTTP ${resp.status}` };
-
-              const contentType = resp.headers.get('Content-Type') ?? 'application/octet-stream';
-              const buffer = await resp.arrayBuffer();
-              const bytes = new Uint8Array(buffer);
-
-              // Convert to base64 (accumulate binary string then btoa)
-              let bin = '';
-              for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-              const dataBase64 = btoa(bin);
-
-              let filename = '';
-              const disposition = resp.headers.get('Content-Disposition') ?? '';
-              if (disposition) {
-                const m = /filename\*\s*=\s*(?:UTF-8|utf-8)'[^']*'([^\s;]+)/i.exec(disposition)
-                  || /filename\s*=\s*"?([^";\n]+)"?/i.exec(disposition);
-                if (m) filename = decodeURIComponent(m[1].trim());
-              }
-              if (!filename) {
-                try {
-                  const seg = new URL(fileUrl).pathname.split('/').pop();
-                  if (seg && seg.includes('.')) filename = decodeURIComponent(seg);
-                } catch { /* */ }
-              }
-
-              return {
-                status: 'success',
-                dataBase64,
-                mimeType: contentType.split(';')[0].trim(),
-                filename: filename || 'attachment',
-                size: bytes.length
-              };
-            } catch (e) {
-              return { status: 'error', error: String(e) };
-            }
-          }
+          args: [url, { maxSize: MAX_BLOB_SIZE, allowedHosts: ATTACHMENT_HOSTS, pageOrigin }],
+          func: downloadAttachment,
         });
-
-        const result = results?.[0]?.result as {
-          status: string; dataBase64?: string; mimeType?: string; filename?: string; size?: number; error?: string;
-        } | null;
+        const result = results?.[0]?.result;
 
         sendResponse(result ?? { status: 'error', error: 'Script returned nothing.' });
       } catch (error) {
